@@ -84,7 +84,6 @@ export function toConfigModel(model: OpenCodeModel): Record<string, unknown> {
     attachment: model.capabilities.attachment,
     tool_call: model.capabilities.toolcall,
     modalities: { input: inputMods, output: outputMods },
-    interleaved: model.capabilities.interleaved,
 
     cost: {
       input: model.cost.input,

@@ -15,6 +15,7 @@ import * as path from "node:path"
 import * as os from "node:os"
 
 import { bridgeOpencodeMcp, __test } from "./src/mcp-bridge.js"
+import { defaultModels, toConfigModel } from "./src/models.js"
 
 const { deepMerge, mergeMcp, translateServer, detectWorktree } = __test
 
@@ -58,6 +59,12 @@ test("deepMerge replaces primitives, deep-merges objects, replaces arrays", () =
     { a: 9, b: { y: 99, z: 3 }, c: [3] },
   )
   assert.deepEqual(out, { a: 9, b: { x: 1, y: 99, z: 3 }, c: [3] })
+})
+
+test("toConfigModel omits unsupported interleaved field", () => {
+  const configModel = toConfigModel(defaultModels["claude-haiku-4-5"])
+
+  assert.equal(Object.hasOwn(configModel, "interleaved"), false)
 })
 
 test("deepMerge ignores undefined source values, keeps target", () => {
