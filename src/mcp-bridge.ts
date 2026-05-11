@@ -3,6 +3,7 @@ import * as path from "node:path"
 import * as os from "node:os"
 import * as crypto from "node:crypto"
 import { log } from "./logger.js"
+import { pluginTmpDir } from "./tmp.js"
 
 /**
  * Bridge opencode's `mcp` config block into a Claude CLI `--mcp-config` file.
@@ -490,8 +491,8 @@ export function bridgeOpencodeMcp(
   const body = JSON.stringify({ mcpServers: servers }, null, 2)
   const hash = crypto.createHash("sha256").update(body).digest("hex").slice(0, 12)
   const outPath = path.join(
-    os.tmpdir(),
-    `opencode-claude-code-mcp-${hash}.json`,
+    pluginTmpDir(),
+    `mcp-${hash}.json`,
   )
   try {
     if (!fileExists(outPath)) {

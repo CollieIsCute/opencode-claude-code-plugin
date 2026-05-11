@@ -2,10 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import * as os from "node:os"
 import * as crypto from "node:crypto"
 import { EventEmitter } from "node:events"
 import { log } from "./logger.js"
+import { pluginTmpDir } from "./tmp.js"
 
 /**
  * Minimal MCP HTTP server embedded in-process. Exposes a set of "proxy"
@@ -386,8 +386,8 @@ export async function createProxyMcpServer(
         .digest("hex")
         .slice(0, 12)
       const outPath = path.join(
-        os.tmpdir(),
-        `opencode-claude-code-proxy-${hash}.json`,
+        pluginTmpDir(),
+        `proxy-${hash}.json`,
       )
       fs.writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 })
       configFilePath = outPath
@@ -401,6 +401,12 @@ export async function createProxyMcpServer(
       await new Promise<void>((resolve) => {
         server.close(() => resolve())
       })
+      if (configFilePath) {
+        try {
+          fs.unlinkSync(configFilePath)
+        } catch {}
+        configFilePath = null
+      }
     },
   }
 
