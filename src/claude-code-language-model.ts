@@ -677,6 +677,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     } = {}
     const toolCalls: Array<{ id: string; name: string; args: unknown }> = []
 
+    // Set true once we observe a `stream_event` envelope. When on, the
+    // top-level `assistant` message is a duplicate of content already
+    // accumulated via the inner content_block_* events — skip it.
+    let gotPartialEvents = false
+
     const result = await new Promise<
       typeof resultMeta & {
         text: string
@@ -687,7 +692,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       rl.on("line", (line) => {
         if (!line.trim()) return
         try {
-          const msg: ClaudeStreamMessage = JSON.parse(line)
+          const outer: ClaudeStreamMessage = JSON.parse(line)
+
+          // Unwrap stream_event envelope (--include-partial-messages).
+          // Inner event uses the same content_block_* / message_* shape.
+          const msg: ClaudeStreamMessage =
+            outer.type === "stream_event" && outer.event
+              ? { ...outer.event, session_id: outer.session_id }
+              : outer
+
+          if (outer.type === "stream_event") {
+            gotPartialEvents = true
+          }
 
           if (this.handleControlRequest(msg, proc)) {
             return
@@ -699,7 +715,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             }
           }
 
-          if (msg.type === "assistant" && msg.message?.content) {
+          if (
+            msg.type === "assistant" &&
+            msg.message?.content &&
+            !gotPartialEvents
+          ) {
             for (const block of msg.message.content) {
               if (block.type === "text" && block.text) {
                 responseText += block.text
@@ -1196,6 +1216,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           } catch {}
         }
 
+        // Set true once we observe a `stream_event` envelope. When on, the
+        // top-level `assistant` message is a duplicate of what we already
+        // streamed via content_block_* deltas — skip its content.
+        let gotPartialEvents = false
+
         const lineHandler = (line: string) => {
           if (!line.trim()) return
           if (controllerClosed) return
@@ -1205,7 +1230,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           startResultFallback()
 
           try {
-            const msg: ClaudeStreamMessage = JSON.parse(line)
+            const outer: ClaudeStreamMessage = JSON.parse(line)
+
+            // Unwrap stream_event envelope (--include-partial-messages).
+            // Inner event uses the same content_block_* / message_* shape.
+            const msg: ClaudeStreamMessage =
+              outer.type === "stream_event" && outer.event
+                ? { ...outer.event, session_id: outer.session_id }
+                : outer
+
+            if (outer.type === "stream_event") {
+              gotPartialEvents = true
+            }
 
             if (handleControlRequest(msg, proc)) {
               return
@@ -1441,8 +1477,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               }
             }
 
-            // assistant message (complete, not streaming)
-            if (msg.type === "assistant" && msg.message?.content) {
+            // assistant message (complete, not streaming).
+            // When --include-partial-messages is on, this is a duplicate of
+            // what we already streamed via content_block_* events. Skip it.
+            if (
+              msg.type === "assistant" &&
+              msg.message?.content &&
+              !gotPartialEvents
+            ) {
               const hasText = msg.message.content.some(
                 (b: any) => b.type === "text" && b.text,
               )

@@ -184,10 +184,12 @@ export function buildCliArgs(opts: {
     appendSystemPromptFile,
   } = opts
   const args = [
+    "--print",
     "--output-format",
     "stream-json",
     "--input-format",
     "stream-json",
+    "--include-partial-messages",
     "--verbose",
   ]
 

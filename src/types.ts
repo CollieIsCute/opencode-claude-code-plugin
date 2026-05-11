@@ -126,6 +126,10 @@ export interface ClaudeStreamMessage {
   subtype?: string
   request_id?: string
 
+  // Present on `stream_event` envelopes when --include-partial-messages is on.
+  // The inner event mirrors the same shape (content_block_*, message_*, etc).
+  event?: ClaudeStreamMessage
+
   request?: {
     subtype?: string
     tool_name?: string
