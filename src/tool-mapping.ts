@@ -140,7 +140,16 @@ export function mapTool(
     }
   }
 
-  // MCP tools: mcp__<server>__<tool> -> <server>_<tool>
+  // Third-party MCP tools: mcp__<server>__<tool> -> <server>_<tool>.
+  // Marked provider-executed because Claude CLI runs these internally via
+  // its own --mcp-config; the tool-result is already in the stream. If we
+  // reported executed:false, opencode would look up the tool in its own
+  // registry, fail to find it, and emit an `invalid` tool error that
+  // shadows the real result.
+  //
+  // Our own proxy tools (`mcp__opencode_proxy__*`) are filtered out by
+  // callers before reaching here, so this branch only ever sees user MCP
+  // servers configured in Claude CLI's settings.
   if (name.startsWith("mcp__")) {
     const parts = name.slice(5).split("__")
     if (parts.length >= 2) {
@@ -148,7 +157,7 @@ export function mapTool(
       const toolName = parts.slice(1).join("_")
       const openCodeName = `${serverName}_${toolName}`
       log.debug("mapping MCP tool", { original: name, mapped: openCodeName })
-      return { name: openCodeName, input, executed: false }
+      return { name: openCodeName, input, executed: true }
     }
   }
 
