@@ -109,6 +109,12 @@ interface AutoContinueState {
 
 interface AutoContinueSnapshot {
   text: string
+  /**
+   * Text of the most recent assistant text block only. Used for final-answer
+   * detection so mid-task narration like "Implementing now. Updated the
+   * search index." in an earlier block doesn't trip the keyword regex.
+   */
+  lastVisibleText: string
   hadReasoning: boolean
   hadToolActivity: boolean
   hadProxyActivity: boolean
@@ -173,9 +179,14 @@ export function shouldAutoContinueIncompleteTurn(
   }
 
   const text = normalizeVisibleText(snapshot.text)
+  const lastText = normalizeVisibleText(snapshot.lastVisibleText)
   if (looksLikeQuestion(text)) return { continue: false, reason: "question" }
   if (looksLikeBlocker(text)) return { continue: false, reason: "blocker" }
-  if (looksLikeFinalAnswer(text)) {
+  // Final-answer detection runs on the most recent text block only. Earlier
+  // blocks may contain mid-task narration that would false-positive the
+  // keyword regex; the model's actual "I'm done" sentence is in the last
+  // block before result/end_turn.
+  if (looksLikeFinalAnswer(lastText)) {
     return { continue: false, reason: "final-answer" }
   }
 
@@ -1455,6 +1466,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           let resultFallbackTimer: ReturnType<typeof setTimeout> | null = null
           let hasReceivedContent = false
           let visibleTextSinceContinue = ""
+          let lastVisibleTextSinceContinue = ""
           let hadReasoningSinceContinue = false
           let hadToolActivitySinceContinue = false
           let hadProxyActivitySinceContinue = false
@@ -1570,6 +1582,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
         const noteVisibleText = (text: string) => {
           visibleTextSinceContinue += text
+          lastVisibleTextSinceContinue += text
+        }
+
+        const resetLastVisibleTextBlock = () => {
+          lastVisibleTextSinceContinue = ""
         }
 
         const noteReasoning = () => {
@@ -1586,6 +1603,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
         const resetAutoContinueWindow = () => {
           visibleTextSinceContinue = ""
+          lastVisibleTextSinceContinue = ""
           hadReasoningSinceContinue = false
           hadToolActivitySinceContinue = false
           hadProxyActivitySinceContinue = false
@@ -1659,6 +1677,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               if (block.type === "text") {
                 textBlockIndices.add(idx)
+                // New text block — clear last-block buffer so final-answer
+                // detection only considers this block's contents, not earlier
+                // mid-task narration.
+                resetLastVisibleTextBlock()
                 if (block.text) {
                   if (!currentTextId) startTextBlock()
                   controller.enqueue({
@@ -1885,6 +1907,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               for (const block of msg.message.content) {
                 if (block.type === "text" && block.text) {
+                  // New text block — keep only this block's text in the
+                  // last-block buffer for final-answer detection.
+                  resetLastVisibleTextBlock()
                   const blockId = startTextBlock()
                   controller.enqueue({
                     type: "text-delta",
@@ -2143,6 +2168,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 autoContinueState,
                 {
                   text: visibleTextSinceContinue,
+                  lastVisibleText: lastVisibleTextSinceContinue,
                   hadReasoning: hadReasoningSinceContinue,
                   hadToolActivity: hadToolActivitySinceContinue,
                   hadProxyActivity: hadProxyActivitySinceContinue,
@@ -2152,6 +2178,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               if (autoDecision.continue) {
                 const signature = continuationSignature({
                   text: visibleTextSinceContinue,
+                  lastVisibleText: lastVisibleTextSinceContinue,
                   hadReasoning: hadReasoningSinceContinue,
                   hadToolActivity: hadToolActivitySinceContinue,
                   hadProxyActivity: hadProxyActivitySinceContinue,
@@ -2163,11 +2190,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     : 0
                 autoContinueState.lastSignature = signature
                 autoContinueState.attempts++
-                log.info("auto-continuing incomplete claude result", {
+                log.notice("auto-continuing incomplete claude result", {
                   sessionKey: sk,
                   reason: autoDecision.reason,
                   attempts: autoContinueState.attempts,
                   textLength: visibleTextSinceContinue.length,
+                  lastTextLength: lastVisibleTextSinceContinue.length,
                   hadReasoning: hadReasoningSinceContinue,
                   hadToolActivity: hadToolActivitySinceContinue,
                   hadProxyActivity: hadProxyActivitySinceContinue,
@@ -2177,10 +2205,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 proc.stdin?.write(makeAutoContinueMessage() + "\n")
                 return
               }
-              log.info("auto-continuation stopped", {
+              log.notice("auto-continuation stopped", {
                 sessionKey: sk,
                 reason: autoDecision.reason,
                 attempts: autoContinueState.attempts,
+                textLength: visibleTextSinceContinue.length,
+                lastTextLength: lastVisibleTextSinceContinue.length,
+                hadReasoning: hadReasoningSinceContinue,
+                hadToolActivity: hadToolActivitySinceContinue,
+                hadProxyActivity: hadProxyActivitySinceContinue,
               })
 
               for (const [idx, reasoningId] of reasoningIds) {

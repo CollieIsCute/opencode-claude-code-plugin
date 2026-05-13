@@ -18,14 +18,24 @@ function state(overrides: Record<string, unknown> = {}) {
 }
 
 function snap(overrides: Record<string, unknown> = {}) {
-  return {
+  const base: Record<string, unknown> = {
     text: "",
+    lastVisibleText: "",
     hadReasoning: false,
     hadToolActivity: false,
     hadProxyActivity: false,
     now: 1_500,
     ...overrides,
-  } as any
+  }
+  // Default lastVisibleText to mirror text unless explicitly overridden, so
+  // legacy single-block test cases keep working.
+  if (
+    overrides.text !== undefined &&
+    overrides.lastVisibleText === undefined
+  ) {
+    base.lastVisibleText = overrides.text
+  }
+  return base as any
 }
 
 test("smart auto-continue is disabled by false", () => {
@@ -132,4 +142,54 @@ test("stops on repeated no-progress continuation", () => {
 test("stops when there was no activity", () => {
   const result = shouldAutoContinueIncompleteTurn(state(), snap())
   assert.deepEqual(result, { continue: false, reason: "no-activity" })
+})
+
+test("ignores final-answer keywords in earlier text blocks", () => {
+  // Earlier mid-task narration contains keywords like 'implemented' and
+  // 'updated' — but the LAST text block is a mid-task pause. Should still
+  // continue.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text:
+        "I implemented the helper. Updated the search index. " +
+        "Now checking the next set of files.",
+      lastVisibleText: "Now checking the next set of files.",
+      hadToolActivity: true,
+    }),
+  )
+  assert.equal(result.continue, true)
+  assert.equal(result.reason, "non-final-progress")
+})
+
+test("stops when the last text block looks like a final answer", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text:
+        "Let me check the files. " +
+        "Found three matches. " +
+        "Done. Implemented the fix and tests passed successfully.",
+      lastVisibleText:
+        "Done. Implemented the fix and tests passed successfully.",
+      hadToolActivity: true,
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "final-answer" })
+})
+
+test("question in any earlier text block still stops continuation", () => {
+  // Even if the last block looks mid-task, a question raised earlier in the
+  // turn should still block auto-continue — answering a question is the
+  // user's job.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text:
+        "Which option do you want me to use? Continuing with the first one for now.",
+      lastVisibleText: "Continuing with the first one for now.",
+      hadToolActivity: true,
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "question" })
 })
