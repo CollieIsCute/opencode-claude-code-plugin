@@ -18,6 +18,7 @@ export interface ClaudeCodeConfig {
   hotReloadMcp?: boolean
   proxyOpencodeMcpTools?: boolean
   multiStepContinuation?: boolean
+  autoContinueIncompleteTurns?: boolean | "smart"
 }
 
 export type WebSearchRouting = "claude" | "disabled" | (string & {})
@@ -130,6 +131,20 @@ export interface ClaudeCodeProviderSettings {
    * decides when to end the turn entirely on its own).
    */
   multiStepContinuation?: boolean
+
+  /**
+   * Smartly continue incomplete Claude CLI results inside the same opencode
+   * turn. Claude CLI sometimes emits `result` after reasoning/tool activity
+   * without a useful final answer, which makes opencode stop and wait for the
+   * user to type "continue". With the default `"smart"`, the plugin detects
+   * those incomplete result boundaries, feeds Claude a small continuation
+   * message internally, and keeps the opencode stream open. Final answers,
+   * questions, blockers, errors, aborts, and safety-budget exhaustion still
+   * stop normally.
+   *
+   * Set to `false` to disable.
+   */
+  autoContinueIncompleteTurns?: boolean | "smart"
 }
 
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max"

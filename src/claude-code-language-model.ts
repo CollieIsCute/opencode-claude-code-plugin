@@ -91,6 +91,121 @@ function hasNewUserContent(
   return false
 }
 
+const AUTO_CONTINUE_MAX_ATTEMPTS = 8
+const AUTO_CONTINUE_MAX_ELAPSED_MS = 10 * 60 * 1000
+const AUTO_CONTINUE_NO_PROGRESS_LIMIT = 2
+
+const AUTO_CONTINUE_PROMPT =
+  "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
+
+interface AutoContinueState {
+  enabled: boolean | "smart" | undefined
+  attempts: number
+  startedAt: number
+  noProgressCount: number
+  lastSignature?: string
+  aborted?: boolean
+}
+
+interface AutoContinueSnapshot {
+  text: string
+  hadReasoning: boolean
+  hadToolActivity: boolean
+  hadProxyActivity: boolean
+  isError?: boolean
+  now?: number
+}
+
+interface AutoContinueDecision {
+  continue: boolean
+  reason: string
+}
+
+function normalizeVisibleText(text: string): string {
+  return text.replace(/\s+/g, " ").trim()
+}
+
+function looksLikeQuestion(text: string): boolean {
+  const normalized = normalizeVisibleText(text).toLowerCase()
+  if (!normalized) return false
+  if (normalized.endsWith("?")) return true
+  return /\b(please confirm|can you confirm|should i|would you like|do you want|which option|choose|pick one|need your|need you to|what would you like)\b/.test(normalized)
+}
+
+function looksLikeBlocker(text: string): boolean {
+  const normalized = normalizeVisibleText(text).toLowerCase()
+  if (!normalized) return false
+  return /\b(blocked|blocker|cannot proceed|can't proceed|unable to proceed|need clarification|need more information|permission denied|failed and needs|requires your|manual step|required from you)\b/.test(normalized)
+}
+
+function looksLikeFinalAnswer(text: string): boolean {
+  const normalized = normalizeVisibleText(text).toLowerCase()
+  if (normalized.length < 40) return false
+  if (looksLikeQuestion(normalized) || looksLikeBlocker(normalized)) return false
+  return /\b(done|completed|fixed|implemented|verified|published|released|sent|delivered|updated)\b/.test(normalized) ||
+    /\b(checks?|tests?) passed\b/.test(normalized) ||
+    /\b(summary|what changed|verification)\b/.test(normalized)
+}
+
+function continuationSignature(snapshot: AutoContinueSnapshot): string {
+  const text = normalizeVisibleText(snapshot.text).slice(-500)
+  return JSON.stringify({
+    text,
+    reasoning: snapshot.hadReasoning,
+    tools: snapshot.hadToolActivity,
+    proxy: snapshot.hadProxyActivity,
+  })
+}
+
+export function shouldAutoContinueIncompleteTurn(
+  state: AutoContinueState,
+  snapshot: AutoContinueSnapshot,
+): AutoContinueDecision {
+  if (state.enabled === false) return { continue: false, reason: "disabled" }
+  if (snapshot.isError) return { continue: false, reason: "error" }
+  if (state.aborted) return { continue: false, reason: "aborted" }
+  if (state.attempts >= AUTO_CONTINUE_MAX_ATTEMPTS) {
+    return { continue: false, reason: "max-attempts" }
+  }
+  const now = snapshot.now ?? Date.now()
+  if (now - state.startedAt > AUTO_CONTINUE_MAX_ELAPSED_MS) {
+    return { continue: false, reason: "max-elapsed" }
+  }
+
+  const text = normalizeVisibleText(snapshot.text)
+  if (looksLikeQuestion(text)) return { continue: false, reason: "question" }
+  if (looksLikeBlocker(text)) return { continue: false, reason: "blocker" }
+  if (looksLikeFinalAnswer(text)) {
+    return { continue: false, reason: "final-answer" }
+  }
+
+  const hadActivity =
+    snapshot.hadReasoning || snapshot.hadToolActivity || snapshot.hadProxyActivity
+  if (!hadActivity) return { continue: false, reason: "no-activity" }
+
+  const signature = continuationSignature(snapshot)
+  const noProgress = signature === state.lastSignature
+  if (noProgress && state.noProgressCount + 1 >= AUTO_CONTINUE_NO_PROGRESS_LIMIT) {
+    return { continue: false, reason: "no-progress" }
+  }
+
+  if (!text) {
+    return { continue: true, reason: "activity-without-visible-answer" }
+  }
+
+  return { continue: true, reason: "non-final-progress" }
+}
+
+function makeAutoContinueMessage(): string {
+  return JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: AUTO_CONTINUE_PROMPT }],
+    },
+  })
+}
+
 function readPromptFileIfPresent(path: string): string | undefined {
   try {
     const content = readFileSync(path, "utf8").trim()
@@ -1339,6 +1454,16 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           let pendingProxyUnsubscribe: (() => void) | null = null
           let resultFallbackTimer: ReturnType<typeof setTimeout> | null = null
           let hasReceivedContent = false
+          let visibleTextSinceContinue = ""
+          let hadReasoningSinceContinue = false
+          let hadToolActivitySinceContinue = false
+          let hadProxyActivitySinceContinue = false
+          const autoContinueState: AutoContinueState = {
+            enabled: self.config.autoContinueIncompleteTurns,
+            attempts: 0,
+            startedAt: Date.now(),
+            noProgressCount: 0,
+          }
 
           const clearFallbackTimer = () => {
             if (resultFallbackTimer) {
@@ -1443,6 +1568,29 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           finishWithToolCalls(batch)
         }
 
+        const noteVisibleText = (text: string) => {
+          visibleTextSinceContinue += text
+        }
+
+        const noteReasoning = () => {
+          hadReasoningSinceContinue = true
+        }
+
+        const noteToolActivity = () => {
+          hadToolActivitySinceContinue = true
+        }
+
+        const noteProxyActivity = () => {
+          hadProxyActivitySinceContinue = true
+        }
+
+        const resetAutoContinueWindow = () => {
+          visibleTextSinceContinue = ""
+          hadReasoningSinceContinue = false
+          hadToolActivitySinceContinue = false
+          hadProxyActivitySinceContinue = false
+        }
+
         // Set true once we observe a `stream_event` envelope. When on, the
         // top-level `assistant` message is a duplicate of what we already
         // streamed via content_block_* deltas — skip its content.
@@ -1499,6 +1647,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               const idx = msg.index
 
               if (block.type === "thinking") {
+                noteReasoning()
                 const reasoningId = generateId()
                 reasoningIds.set(idx, reasoningId)
                 controller.enqueue({
@@ -1517,11 +1666,13 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     id: currentTextId!,
                     delta: block.text,
                   })
+                  noteVisibleText(block.text)
                   hasReceivedContent = true
                 }
               }
 
               if (block.type === "tool_use" && block.id && block.name) {
+                noteToolActivity()
                 toolCallMap.set(idx, {
                   id: block.id,
                   name: block.name,
@@ -1566,6 +1717,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               const idx = msg.index
 
               if (delta.type === "thinking_delta" && delta.thinking) {
+                noteReasoning()
                 const reasoningId = reasoningIds.get(idx)
                 if (reasoningId) {
                   controller.enqueue({
@@ -1583,6 +1735,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   id: currentTextId!,
                   delta: delta.text,
                 })
+                noteVisibleText(delta.text)
                 hasReceivedContent = true
               }
 
@@ -1739,10 +1892,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     delta: block.text,
                   })
                   endTextBlock()
+                  noteVisibleText(block.text)
                   hasReceivedContent = true
                 }
 
                 if (block.type === "thinking" && block.thinking) {
+                  noteReasoning()
                   const thinkingId = generateId()
                   controller.enqueue({
                     type: "reasoning-start",
@@ -1760,6 +1915,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 }
 
                 if (block.type === "tool_use" && block.id && block.name) {
+                  noteToolActivity()
                   const parsedInput = (block.input ?? {}) as Record<
                     string,
                     unknown
@@ -1891,6 +2047,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                       },
                       providerExecuted: true,
                     } as any)
+                    noteToolActivity()
                     log.info("tool result emitted", {
                       toolUseId: block.tool_use_id,
                       name: toolCall.name,
@@ -1981,6 +2138,50 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   ),
                 )
               }
+
+              const autoDecision = shouldAutoContinueIncompleteTurn(
+                autoContinueState,
+                {
+                  text: visibleTextSinceContinue,
+                  hadReasoning: hadReasoningSinceContinue,
+                  hadToolActivity: hadToolActivitySinceContinue,
+                  hadProxyActivity: hadProxyActivitySinceContinue,
+                  isError: msg.is_error,
+                },
+              )
+              if (autoDecision.continue) {
+                const signature = continuationSignature({
+                  text: visibleTextSinceContinue,
+                  hadReasoning: hadReasoningSinceContinue,
+                  hadToolActivity: hadToolActivitySinceContinue,
+                  hadProxyActivity: hadProxyActivitySinceContinue,
+                  isError: msg.is_error,
+                })
+                autoContinueState.noProgressCount =
+                  signature === autoContinueState.lastSignature
+                    ? autoContinueState.noProgressCount + 1
+                    : 0
+                autoContinueState.lastSignature = signature
+                autoContinueState.attempts++
+                log.info("auto-continuing incomplete claude result", {
+                  sessionKey: sk,
+                  reason: autoDecision.reason,
+                  attempts: autoContinueState.attempts,
+                  textLength: visibleTextSinceContinue.length,
+                  hadReasoning: hadReasoningSinceContinue,
+                  hadToolActivity: hadToolActivitySinceContinue,
+                  hadProxyActivity: hadProxyActivitySinceContinue,
+                })
+                turnCompleted = false
+                resetAutoContinueWindow()
+                proc.stdin?.write(makeAutoContinueMessage() + "\n")
+                return
+              }
+              log.info("auto-continuation stopped", {
+                sessionKey: sk,
+                reason: autoDecision.reason,
+                attempts: autoContinueState.attempts,
+              })
 
               for (const [idx, reasoningId] of reasoningIds) {
                 if (reasoningStarted.get(idx)) {
@@ -2124,6 +2325,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             toolCallId: call.toolCallId,
             toolName: call.toolName,
           })
+          noteProxyActivity()
+          noteToolActivity()
           drainBuffer.push(call)
           if (drainTimer) clearTimeout(drainTimer)
           drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
@@ -2134,6 +2337,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         // On abort, keep process alive for next message
         if (options.abortSignal) {
           options.abortSignal.addEventListener("abort", () => {
+            autoContinueState.aborted = true
             if (turnCompleted || controllerClosed) return
 
             if (!hasReceivedContent) {

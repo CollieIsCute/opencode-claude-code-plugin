@@ -69,6 +69,8 @@ export function createClaudeCode(
       hotReloadMcp: settings.hotReloadMcp ?? true,
       proxyOpencodeMcpTools: settings.proxyOpencodeMcpTools ?? true,
       multiStepContinuation: settings.multiStepContinuation ?? true,
+      autoContinueIncompleteTurns:
+        settings.autoContinueIncompleteTurns ?? "smart",
     })
   }
 
