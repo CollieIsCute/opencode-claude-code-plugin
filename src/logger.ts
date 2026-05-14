@@ -59,7 +59,10 @@ export const log = {
     else writeToFile(fmt("INFO", msg, data))
   },
   notice(msg: string, data?: Record<string, unknown>) {
-    emit("NOTICE", msg, data, true)
+    // NOTICE = always-on file log but never console. opencode's TUI surfaces
+    // plugin stderr as a UI warning, so anything we send to console.error
+    // becomes a yellow warning bubble. Reserve that for warn/error.
+    emit("NOTICE", msg, data, false)
   },
   warn(msg: string, data?: Record<string, unknown>) {
     emit("WARN", msg, data, true)
