@@ -270,7 +270,11 @@ export async function createProxyMcpServer(
             timer = setTimeout(() => {
               if (!pending.has(callId)) return
               pending.delete(callId)
-              log.warn("proxy-mcp tool call timed out", {
+              // v0.4.13: demoted from warn to notice. Timeouts are usually
+              // permission-pending while the user is AFK — surfacing each as
+              // a yellow UI bubble produces a wall of noise on return. The
+              // file log still captures the event for diagnostics.
+              log.notice("proxy-mcp tool call timed out", {
                 callId,
                 toolName,
                 timeoutMs: PROXY_CALL_TIMEOUT_MS,
@@ -317,8 +321,17 @@ export async function createProxyMcpServer(
         error: { code: -32601, message: `Unknown method: ${request.method}` },
       })
     } catch (error) {
-      log.warn("proxy-mcp error handling request", {
-        error: error instanceof Error ? error.message : String(error),
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // v0.4.13: timeout rejections from the broker propagate up here. They
+      // are the canonical AFK-permission-pending shape — keep file logged
+      // but don't shout at the user. Other error shapes stay as WARN so
+      // genuine bugs remain visible.
+      const isTimeout =
+        errorMessage.includes("timed out after") &&
+        errorMessage.includes("waiting for opencode to resolve")
+      const logFn = isTimeout ? log.notice : log.warn
+      logFn("proxy-mcp error handling request", {
+        error: errorMessage,
       })
       try {
         writeJson(res, {

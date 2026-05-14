@@ -82,7 +82,10 @@ export function queuePendingProxyCall(
         `Proxy tool call '${call.toolName}' timed out after ${PENDING_PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
       ),
     )
-    log.warn("timed out pending proxy call", {
+    // v0.4.13: demoted from warn to notice. AFK-permission-pending
+    // sessions can stack many of these; demoting keeps the UI quiet on
+    // return while preserving the audit trail in plugin.log.
+    log.notice("timed out pending proxy call", {
       sessionKey: current.sessionKey,
       toolCallId: call.id,
       toolName: call.toolName,
