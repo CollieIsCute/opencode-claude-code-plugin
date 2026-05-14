@@ -153,7 +153,10 @@ export function rejectPendingProxyCallById(
   indexRemove(pending.sessionKey, toolCallId)
   clearTimeout(pending.timer)
   pending.reject(error)
-  log.warn("rejected pending proxy call", {
+  // Rejection is the broker's cleanup mechanism — fires on timeouts, orphans,
+  // stream closes, etc. None are user-actionable. File-log them at NOTICE so
+  // the audit trail is intact; rely on caller sites to decide TUI visibility.
+  log.notice("rejected pending proxy call", {
     sessionKey: pending.sessionKey,
     toolCallId: pending.toolCallId,
     toolName: pending.toolName,

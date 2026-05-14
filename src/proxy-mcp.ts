@@ -322,14 +322,17 @@ export async function createProxyMcpServer(
       })
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      // v0.4.13: timeout rejections from the broker propagate up here. They
-      // are the canonical AFK-permission-pending shape — keep file logged
-      // but don't shout at the user. Other error shapes stay as WARN so
-      // genuine bugs remain visible.
-      const isTimeout =
-        errorMessage.includes("timed out after") &&
-        errorMessage.includes("waiting for opencode to resolve")
-      const logFn = isTimeout ? log.notice : log.warn
+      // v0.4.13 + v0.4.19: cleanup rejections from the broker propagate up
+      // here. None are user-actionable — they fire on AFK-permission timeouts,
+      // orphan-rejections after a turn boundary, stream closes, etc. File-log
+      // them at NOTICE; other error shapes stay as WARN so genuine bugs remain
+      // visible in the TUI.
+      const isExpectedCleanup =
+        (errorMessage.includes("timed out after") &&
+          errorMessage.includes("waiting for opencode to resolve")) ||
+        errorMessage.includes("rejecting as orphaned") ||
+        errorMessage.includes("was orphaned by a new user turn")
+      const logFn = isExpectedCleanup ? log.notice : log.warn
       logFn("proxy-mcp error handling request", {
         error: errorMessage,
       })

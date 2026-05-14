@@ -2510,7 +2510,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
               resolvePendingProxyCallById(call.toolCallId, result)
             } else {
-              log.warn(
+              log.notice(
                 "pending proxy call had no matching tool-result; rejecting as orphan",
                 {
                   sessionKey: sk,
