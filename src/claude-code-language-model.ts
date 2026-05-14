@@ -133,6 +133,16 @@ interface AutoContinueSnapshot {
   hadToolActivity: boolean
   hadProxyActivity: boolean
   isError?: boolean
+  /**
+   * Protocol-level stop signal from the Claude API (forwarded by Claude
+   * CLI). When present and non-empty, we trust it as authoritative — the
+   * model itself signaled why the turn ended (`end_turn`, `max_tokens`,
+   * `stop_sequence`, `refusal`, `pause_turn`, `tool_use`, etc.) — and stop
+   * without running the keyword regex. The heuristic only runs as a
+   * fallback when `stop_reason` is missing (older CLI versions, abrupt
+   * termination).
+   */
+  stopReason?: string | null
   now?: number
 }
 
@@ -219,6 +229,18 @@ export function shouldAutoContinueIncompleteTurn(
   if (state.enabled === false) return { continue: false, reason: "disabled" }
   if (snapshot.isError) return { continue: false, reason: "error" }
   if (state.aborted) return { continue: false, reason: "aborted" }
+  // v0.4.17: trust ANY protocol-level stop_reason as authoritative. If
+  // Claude CLI emitted a stop_reason value at all, the model has signaled
+  // a stop — honor it without consulting the keyword heuristic. The
+  // heuristic only runs as a fallback when stop_reason is missing (older
+  // CLI versions / edge cases). Maps snake_case → kebab-case for reason
+  // label consistency with other reasons.
+  if (snapshot.stopReason) {
+    return {
+      continue: false,
+      reason: snapshot.stopReason.replace(/_/g, "-"),
+    }
+  }
   if (state.attempts >= AUTO_CONTINUE_MAX_ATTEMPTS) {
     return { continue: false, reason: "max-attempts" }
   }
@@ -1519,6 +1541,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           let hadReasoningSinceContinue = false
           let hadToolActivitySinceContinue = false
           let hadProxyActivitySinceContinue = false
+          // v0.4.16: protocol-level stop signal captured from Claude CLI's
+          // stream. Set by either the `message_delta` partial event or the
+          // top-level `assistant` message, whichever arrives first.
+          let lastStopReason: string | null = null
           const autoContinueState: AutoContinueState = {
             enabled: self.config.autoContinueIncompleteTurns,
             attempts: 0,
@@ -1656,6 +1682,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           hadReasoningSinceContinue = false
           hadToolActivitySinceContinue = false
           hadProxyActivitySinceContinue = false
+          lastStopReason = null
         }
 
         // Set true once we observe a `stream_event` envelope. When on, the
@@ -1928,9 +1955,30 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               }
             }
 
+            // Capture protocol-level stop_reason from the streaming
+            // `message_delta` event (sent right before the final
+            // `message_stop`). Any non-empty value is the source-of-truth
+            // for why the turn ended — used to bypass the keyword heuristic.
+            if (
+              gotPartialEvents &&
+              msg.type === "message_delta" &&
+              typeof (msg as any).delta?.stop_reason === "string"
+            ) {
+              lastStopReason = (msg as any).delta.stop_reason
+            }
+
             // assistant message (complete, not streaming).
             // When --include-partial-messages is on, this is a duplicate of
-            // what we already streamed via content_block_* events. Skip it.
+            // what we already streamed via content_block_* events. Skip it
+            // for content, but still capture stop_reason from it for the
+            // non-partial path.
+            if (
+              msg.type === "assistant" &&
+              msg.message &&
+              typeof (msg.message as any).stop_reason === "string"
+            ) {
+              lastStopReason = (msg.message as any).stop_reason
+            }
             if (
               msg.type === "assistant" &&
               msg.message?.content &&
@@ -2222,6 +2270,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   hadToolActivity: hadToolActivitySinceContinue,
                   hadProxyActivity: hadProxyActivitySinceContinue,
                   isError: msg.is_error,
+                  stopReason: lastStopReason,
                 },
               )
               if (autoDecision.continue) {
@@ -2257,6 +2306,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               log.notice("auto-continuation stopped", {
                 sessionKey: sk,
                 reason: autoDecision.reason,
+                stopReason: lastStopReason,
                 attempts: autoContinueState.attempts,
                 textLength: visibleTextSinceContinue.length,
                 lastTextLength: lastVisibleTextSinceContinue.length,

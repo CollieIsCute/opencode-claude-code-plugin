@@ -464,3 +464,139 @@ test("v0.4.15 'tests pass' (present tense) stops as final-answer", () => {
   )
   assert.deepEqual(result, { continue: false, reason: "final-answer" })
 })
+
+test("v0.4.16 end_turn stop_reason short-circuits heuristic", () => {
+  // Even a long ambiguous mid-task narration with no completion keywords
+  // and visible tool activity gets stopped immediately when Claude CLI
+  // signals end_turn. This is the architectural alternative to chasing
+  // soft-proceed idioms via regex (v0.4.10-15).
+  const ambiguous =
+    "Running the next probe to inspect the build output and confirm bundle sizes are roughly equal."
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text: ambiguous,
+      hadReasoning: true,
+      hadToolActivity: true,
+      stopReason: "end_turn",
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "end-turn" })
+})
+
+test("v0.4.16 end_turn beats max-attempts (decided last)", () => {
+  // End-turn wins over budget guards too — once the model says it's done,
+  // there's no value in burning more attempts.
+  const result = shouldAutoContinueIncompleteTurn(
+    state({ attempts: 999 }),
+    snap({ stopReason: "end_turn", hadReasoning: true }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "end-turn" })
+})
+
+test("v0.4.16 end_turn does NOT beat genuine error", () => {
+  // is_error still wins. Defensive: we don't want to silently treat a CLI
+  // error as a clean stop.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "end_turn", isError: true }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "error" })
+})
+
+test("v0.4.16 end_turn does NOT beat abort", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state({ aborted: true }),
+    snap({ stopReason: "end_turn" }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "aborted" })
+})
+
+test("v0.4.17 max_tokens stop_reason stops via protocol signal", () => {
+  // v0.4.17: ANY stop_reason value is authoritative. max_tokens is the
+  // model signaling a stop (it was cut off but the protocol said stop).
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text: "Working on it",
+      hadReasoning: true,
+      hadToolActivity: true,
+      stopReason: "max_tokens",
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "max-tokens" })
+})
+
+test("v0.4.17 stop_sequence stops via protocol signal", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "stop_sequence", hadReasoning: true }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "stop-sequence" })
+})
+
+test("v0.4.17 refusal stops via protocol signal", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "refusal" }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "refusal" })
+})
+
+test("v0.4.17 pause_turn stops via protocol signal", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "pause_turn", hadReasoning: true }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "pause-turn" })
+})
+
+test("v0.4.17 tool_use stops via protocol signal", () => {
+  // Defensive: tool_use shouldn't normally reach the result boundary
+  // (drain timer closes the stream first), but if it does we honor it.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "tool_use", hadToolActivity: true }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "tool-use" })
+})
+
+test("v0.4.17 unknown stop_reason still stops (forward-compat)", () => {
+  // If Anthropic adds a new stop_reason value, we trust it as authoritative
+  // and stop. Safer than running the keyword heuristic on unknown shape.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "future_value_we_dont_know" }),
+  )
+  assert.deepEqual(result, {
+    continue: false,
+    reason: "future-value-we-dont-know",
+  })
+})
+
+test("v0.4.17 empty-string stop_reason falls through (falsy)", () => {
+  // Empty string is falsy — fall back to heuristic, same as null/undefined.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text: "We're done.",
+      hadReasoning: true,
+      stopReason: "",
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "final-answer" })
+})
+
+test("v0.4.16 missing stop_reason falls through (back-compat)", () => {
+  // When stop_reason is undefined or null, the heuristic must still run
+  // unchanged. Protects against CLI versions / paths that don't surface it.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text: "We're done.",
+      hadReasoning: true,
+      stopReason: null,
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "final-answer" })
+})
