@@ -435,6 +435,7 @@ plugin internals.
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
 - Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
 - Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
+- **Subagent todos require explicit permission.** opencode's task tool gates `todowrite` per subagent: without a `permission: { todowrite: "allow" }` rule on the subagent definition, opencode injects `todowrite: false` into the tools dict and the plugin's synthetic `todowrite` emissions surface as `⚙ invalid todowrite` rows. The built-in `general` subagent denies `todowrite` by default; use a custom subagent for parallel work that needs todo visibility. Subagent todos render inline in the **subagent's** session view (navigate with the TUI's `session.child.next` / `session.parent` commands), not in the parent session's panel.
 
 ---
 
