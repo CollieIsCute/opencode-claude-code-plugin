@@ -85,6 +85,30 @@ export type OpenCodeEvent = {
   [key: string]: unknown
 }
 
+/**
+ * Input shape for the `chat.params` hook. opencode passes the agent name
+ * for the current call ("default", "compaction", "title", etc.), the
+ * resolved model, and the user message. Output is the mutable params bag
+ * the hook can adjust before opencode forwards them to the LM.
+ */
+export type OpenCodeChatParamsInput = {
+  sessionID?: string
+  agent?: string
+  model?: OpenCodeModel & { providerID: ProviderID }
+  // Matches opencode SDK ProviderContext: { source, info, options }.
+  // The provider id lives at provider.info.id, not provider.id.
+  provider?: { source?: string; info?: { id?: ProviderID }; options?: Record<string, unknown> }
+  message?: unknown
+}
+
+export type OpenCodeChatParamsOutput = {
+  temperature?: number
+  topP?: number
+  topK?: number
+  maxOutputTokens?: number
+  options?: Record<string, unknown>
+}
+
 export type OpenCodeHooks = {
   config?: (input: OpenCodeConfig) => Promise<void>
   provider?: {
@@ -94,6 +118,10 @@ export type OpenCodeHooks = {
   // Called for every bus event opencode publishes. Optional; this plugin
   // doesn't currently subscribe — MCP config drift is handled at turn start.
   event?: (input: { event: OpenCodeEvent }) => Promise<void>
+  "chat.params"?: (
+    input: OpenCodeChatParamsInput,
+    output: OpenCodeChatParamsOutput,
+  ) => Promise<void>
 }
 
 export type OpenCodePlugin = (input: unknown, options?: Record<string, unknown>) => Promise<OpenCodeHooks>

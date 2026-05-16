@@ -29,9 +29,12 @@ import {
   getClaudeSessionId,
   deleteClaudeSessionId,
   deleteActiveProcess,
+  claudeSpawnEnv,
+  isClaudeThinkingDisabled,
   sessionKey,
 } from "./session-manager.js"
 import { log } from "./logger.js"
+import { detectCliVersion } from "./cli-version.js"
 import {
   createProxyMcpServer,
   disallowedToolFlags,
@@ -56,6 +59,45 @@ import { unlink } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
+
+/**
+ * Default model used for opencode `/compact`. Haiku 4.5 is fast
+ * (~150 tok/s), has a hard 8k output cap that bounds latency, and is a
+ * strong structured summarizer. Override per-project via the
+ * `compactionModel` provider setting in opencode.json / opencode.jsonc,
+ * or per-run via the `CLAUDE_CODE_COMPACTION_MODEL` env var (env wins).
+ */
+export const DEFAULT_COMPACTION_MODEL = "claude-haiku-4-5"
+
+/**
+ * Pick the model used to handle /compact. Precedence:
+ *   1. `CLAUDE_CODE_COMPACTION_MODEL` env var (per-process override)
+ *   2. `configured` argument (the `compactionModel` provider setting)
+ *   3. `DEFAULT_COMPACTION_MODEL`
+ *
+ * Exported as a free function so it can be unit-tested without
+ * instantiating the language model class.
+ */
+export function resolveCompactionModel(configured?: string): string {
+  const env = process.env.CLAUDE_CODE_COMPACTION_MODEL?.trim()
+  if (env) return env
+  const trimmed = configured?.trim()
+  if (trimmed) return trimmed
+  return DEFAULT_COMPACTION_MODEL
+}
+
+/**
+ * Stream delta types we handle explicitly. `signature_delta` is listed as
+ * known-and-silent: it carries encrypted thinking-block signatures that
+ * are opaque to clients (the server uses them to reconstitute thinking
+ * across turns), so there's nothing for us to do but ignore it.
+ */
+const KNOWN_DELTA_TYPES = new Set([
+  "thinking_delta",
+  "text_delta",
+  "input_json_delta",
+  "signature_delta",
+])
 
 /**
  * True if the prompt has any user-side content after the last assistant
@@ -718,6 +760,49 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     return valid.includes(effort) ? effort : undefined
   }
 
+  private getOpencodeAgent(
+    providerOptions?: LanguageModelV3CallOptions["providerOptions"],
+  ): string | undefined {
+    if (!providerOptions) return undefined
+    const ownKey = this.config.provider
+    const bag =
+      (providerOptions as any)[ownKey] ??
+      (providerOptions as any)["claude-code"]
+    const agent = bag?.opencodeAgent
+    return typeof agent === "string" ? agent : undefined
+  }
+
+  private isCompactionCall(
+    options: LanguageModelV3CallOptions,
+  ): boolean {
+    return this.getOpencodeAgent(options.providerOptions) === "compaction"
+  }
+
+  /**
+   * Pick the model used to handle /compact. Precedence:
+   *   1. `CLAUDE_CODE_COMPACTION_MODEL` env var (per-process override)
+   *   2. `compactionModel` provider setting (opencode.json / .jsonc)
+   *   3. Built-in default (claude-haiku-4-5)
+   */
+  private resolveCompactionModel(): string {
+    return resolveCompactionModel(this.config.compactionModel)
+  }
+
+  private thinkingCliOptions(): {
+    thinking?: "enabled"
+    thinkingDisplay?: "summarized"
+  } {
+    if (isClaudeThinkingDisabled()) return {}
+
+    return {
+      thinking: "enabled",
+      thinkingDisplay:
+        process.env.CLAUDE_CODE_SHOW_THINKING_SUMMARIES === undefined
+          ? "summarized"
+          : undefined,
+    }
+  }
+
   private latestUserText(
     prompt: LanguageModelV3CallOptions["prompt"],
   ): string {
@@ -885,6 +970,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // still route through opencode permissions/execution. Same for
     // opencode MCP proxying — doStream is the only path that wires up the
     // proxy server with the dynamically-discovered MCP tool defs.
+    const compactionMode = this.isCompactionCall(options)
+
     if (
       scope === "tools" &&
       (this.resolvedProxyTools() ||
@@ -894,7 +981,22 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       return this.doGenerateViaStream(options)
     }
 
+    // Route compaction through doStream so it gets the lean spawn path,
+    // model override, and rich transcript handling. Aggregating a stream
+    // for doGenerate matches what doGenerateViaStream already does for
+    // proxy tools.
+    if (compactionMode) {
+      return this.doGenerateViaStream(options)
+    }
+
     if (scope === "no-tools") {
+      log.info("doGenerate no-tools title stub", {
+        compactionMode,
+        opencodeAgent: this.getOpencodeAgent(options.providerOptions),
+        providerOptionsKeys: options.providerOptions
+          ? Object.keys(options.providerOptions)
+          : [],
+      })
       const text = this.synthesizeTitle(options.prompt)
       return {
         content: [{ type: "text", text }] as any,
@@ -962,7 +1064,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // doGenerate always spawns a fresh process, never reuse session ID.
     // Pre-fetch opencode's MCP runtime status so the bridge overlays
     // UI-toggled state on top of disk config.
-    const runtimeStatus = await getRuntimeMcpStatus()
+    const [runtimeStatus, cliVersion] = await Promise.all([
+      getRuntimeMcpStatus(),
+      detectCliVersion(this.config.cliPath),
+    ])
     const systemPromptFile = buildAppendedSystemPrompt(
       cwd,
       this.config.multiStepContinuation !== false,
@@ -978,6 +1083,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       disallowedTools:
         this.config.webSearch === "disabled" ? ["WebSearch"] : undefined,
       appendSystemPromptFile: systemPromptFile,
+      ...this.thinkingCliOptions(),
+      cliVersion,
     })
 
     log.info("doGenerate starting", {
@@ -993,7 +1100,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const proc = spawn(this.config.cliPath, cliArgs, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, TERM: "xterm-256color" },
+      env: claudeSpawnEnv(),
       shell: process.platform === "win32",
     })
 
@@ -1285,12 +1392,27 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const skipPermissions = this.config.skipPermissions !== false
     const scope = this.requestScope(options as any)
     const affinity = this.sessionAffinity(options)
-    const sk = sessionKey(cwd, `${this.modelId}::${scope}::${affinity}`)
+    const compactionMode = this.isCompactionCall(options)
+    // Use a separate session key for compaction so its short-lived spawn
+    // never collides with the main conversation's claude process.
+    const effectiveModelId = compactionMode
+      ? this.resolveCompactionModel()
+      : this.modelId
+    const sk = compactionMode
+      ? sessionKey(cwd, `${effectiveModelId}::compaction::${affinity}`)
+      : sessionKey(cwd, `${this.modelId}::${scope}::${affinity}`)
     const toUsage = this.toUsage.bind(this)
     const toFinishReason = this.toFinishReason.bind(this)
     const handleControlRequest = this.handleControlRequest.bind(this)
 
-    if (scope === "no-tools") {
+    if (scope === "no-tools" && !compactionMode) {
+      log.info("doStream no-tools title stub", {
+        compactionMode,
+        opencodeAgent: this.getOpencodeAgent(options.providerOptions),
+        providerOptionsKeys: options.providerOptions
+          ? Object.keys(options.providerOptions)
+          : [],
+      })
       const text = this.synthesizeTitle(options.prompt)
       const textId = generateId()
       const stream = new ReadableStream<LanguageModelV3StreamPart>({
@@ -1367,11 +1489,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       options.prompt,
       includeHistoryContext,
       reasoningEffort,
+      { compactionMode },
     )
-    const resolvedProxy = this.resolvedProxyTools()
+    const resolvedProxy = compactionMode ? null : this.resolvedProxyTools()
     const self = this
 
-    const previousPendingProxyCalls = getPendingProxyCalls(sk)
+    const previousPendingProxyCalls = compactionMode
+      ? []
+      : getPendingProxyCalls(sk)
     const previousPendingProxyMatches: Array<{
       call: PendingProxyCall
       result: ProxyToolResult | null
@@ -1387,20 +1512,39 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // ReadableStream so the sync hot-reload check and async setup() see
     // the same overlay snapshot. One in-process call per turn — cheap;
     // the SDK client routes through `Server.app.fetch` (no socket).
-    const runtimeStatus = await getRuntimeMcpStatus()
+    // Detect the Claude CLI version in parallel so the spawn can decide
+    // which optional flags it supports without crashing older binaries.
+    const [runtimeStatus, cliVersion] = await Promise.all([
+      compactionMode ? Promise.resolve(undefined) : getRuntimeMcpStatus(),
+      detectCliVersion(this.config.cliPath),
+    ])
 
     log.info("doStream starting", {
       cwd,
-      model: this.modelId,
+      model: effectiveModelId,
       textLength: userMsg.length,
       includeHistoryContext,
       hasActiveProcess,
       reasoningEffort,
       proxyTools: resolvedProxy?.map((t) => t.name) ?? null,
+      compactionMode,
+      scope,
+      opencodeAgent: this.getOpencodeAgent(options.providerOptions),
+      providerOptionsKeys: options.providerOptions
+        ? Object.keys(options.providerOptions)
+        : [],
     })
 
     const stream = new ReadableStream<LanguageModelV3StreamPart>({
       start(controller) {
+        // Compaction is a one-shot call. Don't reuse any cached process
+        // from a prior compaction — each /compact gets a fresh spawn so
+        // the new transcript isn't appended to a stale claude session.
+        if (compactionMode) {
+          deleteActiveProcess(sk)
+          deleteClaudeSessionId(sk)
+        }
+
         let activeProcess = getActiveProcess(sk)
         let proc: import("child_process").ChildProcess
         let lineEmitter: import("events").EventEmitter
@@ -1412,11 +1556,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         // session id is preserved so the respawn resumes the conversation
         // via `--session-id` (handled by buildCliArgs).
         if (
+          !compactionMode &&
           activeProcess &&
           self.config.hotReloadMcp !== false &&
           self.config.bridgeOpencodeMcp !== false
         ) {
-          const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus)
+          const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
           const previousHash = activeProcess.mcpHash ?? null
           if (previousHash !== probe.bridgedHash) {
             log.info("opencode MCP config changed, respawning claude", {
@@ -1431,63 +1576,91 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         }
 
         const setup = async () => {
-          // First pass: discover which opencode MCP servers would be bridged.
-          // We use this to decide which ones to re-route through the proxy
-          // instead. No --mcp-config path is consumed here; it's recomputed
-          // below with the exclusion set in place.
-          const discovery = self.effectiveMcpConfig(
-            cwd,
-            undefined,
-            runtimeStatus,
-          )
+          let cliArgs: string[]
+          let spawnSystemPromptFile: string | undefined
+          let spawnProxyServer: ProxyMcpServer | null = null
+          let spawnMcpHash: string | null = null
 
-          // Fetch the proxy MCP tools (one ProxyToolDef per opencode MCP-
-          // bridged tool). If discovery returns nothing or the SDK is
-          // unreachable, this is null and we fall back to direct bridging.
-          const proxyMcpTools = await self.resolvedProxyMcpTools(
-            discovery.allEnabledServerNames,
-          )
-          const excludeServers: ReadonlySet<string> | undefined = proxyMcpTools
-            ? new Set(discovery.allEnabledServerNames)
-            : undefined
+          if (compactionMode) {
+            // Compaction takes a lean spawn: no MCP servers, no proxy, no
+            // appended system prompt, no disallowed-tools list. The model
+            // is asked for text output only on a single turn — all the
+            // normal tool wiring is pure overhead and adds latency.
+            // Explicitly opt out of `--session-id` so a stale id can never
+            // resume into the lean spawn.
+            cliArgs = buildCliArgs({
+              sessionKey: sk,
+              skipPermissions,
+              includeSessionId: false,
+              model: effectiveModelId,
+              permissionMode: self.config.permissionMode,
+              cliVersion,
+            })
+          } else {
+            // First pass: discover which opencode MCP servers would be
+            // bridged. We use this to decide which ones to re-route through
+            // the proxy instead. No --mcp-config path is consumed here;
+            // it's recomputed below with the exclusion set in place.
+            const discovery = self.effectiveMcpConfig(
+              cwd,
+              undefined,
+              runtimeStatus!,
+            )
 
-          const combinedProxyTools: ProxyToolDef[] | null =
-            resolvedProxy || proxyMcpTools
-              ? [...(resolvedProxy ?? []), ...(proxyMcpTools ?? [])]
-              : null
+            // Fetch the proxy MCP tools (one ProxyToolDef per opencode
+            // MCP-bridged tool). If discovery returns nothing or the SDK
+            // is unreachable, this is null and we fall back to direct
+            // bridging.
+            const proxyMcpTools = await self.resolvedProxyMcpTools(
+              discovery.allEnabledServerNames,
+            )
+            const excludeServers: ReadonlySet<string> | undefined = proxyMcpTools
+              ? new Set(discovery.allEnabledServerNames)
+              : undefined
 
-          if (!proxyServer && combinedProxyTools) {
-            proxyServer = await self.ensureProxyServer(combinedProxyTools, sk)
+            const combinedProxyTools: ProxyToolDef[] | null =
+              resolvedProxy || proxyMcpTools
+                ? [...(resolvedProxy ?? []), ...(proxyMcpTools ?? [])]
+                : null
+
+            if (!proxyServer && combinedProxyTools) {
+              proxyServer = await self.ensureProxyServer(combinedProxyTools, sk)
+            }
+
+            const proxyDisallowed = resolvedProxy ? disallowedToolFlags(resolvedProxy) : []
+            const extraDisallowed: string[] = []
+            if (self.config.webSearch === "disabled") extraDisallowed.push("WebSearch")
+            const allDisallowed = [...proxyDisallowed, ...extraDisallowed]
+            const mcp = self.effectiveMcpConfig(
+              cwd,
+              proxyServer?.configPath(),
+              runtimeStatus!,
+              excludeServers,
+            )
+            const systemPromptFile = activeProcess
+              ? undefined
+              : buildAppendedSystemPrompt(
+                  cwd,
+                  self.config.multiStepContinuation !== false,
+                )
+            cliArgs = buildCliArgs({
+              sessionKey: sk,
+              skipPermissions,
+              model: self.modelId,
+              permissionMode: self.config.permissionMode,
+              mcpConfig: mcp.paths,
+              strictMcpConfig: self.config.strictMcpConfig,
+              disallowedTools: allDisallowed.length > 0 ? allDisallowed : undefined,
+              appendSystemPromptFile: systemPromptFile,
+              ...self.thinkingCliOptions(),
+              cliVersion,
+            })
+            spawnSystemPromptFile = systemPromptFile
+            spawnProxyServer = proxyServer
+            spawnMcpHash = mcp.bridgedHash
           }
 
-          const proxyDisallowed = resolvedProxy ? disallowedToolFlags(resolvedProxy) : []
-          const extraDisallowed: string[] = []
-          if (self.config.webSearch === "disabled") extraDisallowed.push("WebSearch")
-          const allDisallowed = [...proxyDisallowed, ...extraDisallowed]
-          const mcp = self.effectiveMcpConfig(
-            cwd,
-            proxyServer?.configPath(),
-            runtimeStatus,
-            excludeServers,
-          )
-          const systemPromptFile = activeProcess
-            ? undefined
-            : buildAppendedSystemPrompt(
-                cwd,
-                self.config.multiStepContinuation !== false,
-              )
-          const cliArgs = buildCliArgs({
-            sessionKey: sk,
-            skipPermissions,
-            model: self.modelId,
-            permissionMode: self.config.permissionMode,
-            mcpConfig: mcp.paths,
-            strictMcpConfig: self.config.strictMcpConfig,
-            disallowedTools: allDisallowed.length > 0 ? allDisallowed : undefined,
-            appendSystemPromptFile: systemPromptFile,
-          })
-
-          if (activeProcess) {
+          if (activeProcess && !compactionMode) {
             proc = activeProcess.proc
             lineEmitter = activeProcess.lineEmitter
             log.debug("reusing active process", { sk })
@@ -1497,9 +1670,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               cliArgs,
               cwd,
               sk,
-              proxyServer,
-              mcp.bridgedHash,
-              systemPromptFile,
+              spawnProxyServer,
+              spawnMcpHash,
+              spawnSystemPromptFile,
             )
             proc = ap.proc
             lineEmitter = ap.lineEmitter
@@ -1530,6 +1703,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
           const reasoningIds = new Map<number, string>()
           const reasoningStarted = new Map<number, boolean>()
+          let hadThinkingTextFromStream = false
 
           let turnCompleted = false
           let controllerClosed = false
@@ -1744,11 +1918,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 noteReasoning()
                 const reasoningId = generateId()
                 reasoningIds.set(idx, reasoningId)
-                controller.enqueue({
-                  type: "reasoning-start",
-                  id: reasoningId,
-                } as any)
-                reasoningStarted.set(idx, true)
               }
 
               if (block.type === "text") {
@@ -1816,8 +1985,16 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               if (delta.type === "thinking_delta" && delta.thinking) {
                 noteReasoning()
+                hadThinkingTextFromStream = true
                 const reasoningId = reasoningIds.get(idx)
                 if (reasoningId) {
+                  if (!reasoningStarted.get(idx)) {
+                    controller.enqueue({
+                      type: "reasoning-start",
+                      id: reasoningId,
+                    } as any)
+                    reasoningStarted.set(idx, true)
+                  }
                   controller.enqueue({
                     type: "reasoning-delta",
                     id: reasoningId,
@@ -1847,6 +2024,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     delta: delta.partial_json,
                   } as any)
                 }
+              }
+
+              if (!KNOWN_DELTA_TYPES.has(delta.type)) {
+                log.debug("unrecognized content_block_delta type", {
+                  type: delta.type,
+                  idx,
+                  keys: Object.keys(delta),
+                })
               }
             }
 
@@ -1978,6 +2163,49 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               typeof (msg.message as any).stop_reason === "string"
             ) {
               lastStopReason = (msg.message as any).stop_reason
+            }
+            // Fallback: extract thinking from the complete assistant
+            // message. opus-4-7's CLI strips thinking_delta from stream
+            // events but may include thinking in the final message.
+            if (
+              msg.type === "assistant" &&
+              msg.message?.content &&
+              gotPartialEvents
+            ) {
+              const thinkingBlocks = (msg.message.content as any[]).filter(
+                (b) => b.type === "thinking",
+              )
+              if (thinkingBlocks.length > 0) {
+                log.info("assistant message thinking blocks", {
+                  count: thinkingBlocks.length,
+                  hasText: thinkingBlocks.some(
+                    (b) => typeof b.thinking === "string" && b.thinking.length > 0,
+                  ),
+                  hadStreamThinking: hadThinkingTextFromStream,
+                })
+                if (!hadThinkingTextFromStream) {
+                  for (const block of thinkingBlocks) {
+                    if (block.thinking && block.thinking.length > 0) {
+                      noteReasoning()
+                      hadThinkingTextFromStream = true
+                      const thinkingId = generateId()
+                      controller.enqueue({
+                        type: "reasoning-start",
+                        id: thinkingId,
+                      } as any)
+                      controller.enqueue({
+                        type: "reasoning-delta",
+                        id: thinkingId,
+                        delta: block.thinking,
+                      } as any)
+                      controller.enqueue({
+                        type: "reasoning-end",
+                        id: thinkingId,
+                      } as any)
+                    }
+                  }
+                }
+              }
             }
             if (
               msg.type === "assistant" &&
@@ -2329,7 +2557,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 finishReason: toFinishReason("stop"),
                 usage: toUsage(msg.usage),
                 providerMetadata: {
-                  "claude-code": resultMeta,
+                  "claude-code": {
+                    ...resultMeta,
+                    ...(compactionMode
+                      ? { compactionModel: effectiveModelId }
+                      : {}),
+                  },
                   ...(typeof msg.usage?.cache_creation_input_tokens === "number"
                     ? {
                         anthropic: {
@@ -2379,7 +2612,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             finishReason: toFinishReason("stop"),
             usage: toUsage(),
             providerMetadata: {
-              "claude-code": resultMeta,
+              "claude-code": {
+                ...resultMeta,
+                ...(compactionMode
+                  ? { compactionModel: effectiveModelId }
+                  : {}),
+              },
             },
           })
           try {

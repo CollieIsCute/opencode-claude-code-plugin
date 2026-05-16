@@ -4,6 +4,11 @@ import { EventEmitter } from "node:events"
 import { unlink } from "node:fs/promises"
 import { log } from "./logger.js"
 import type { ProxyMcpServer } from "./proxy-mcp.js"
+import {
+  cliSupportsThinking,
+  cliSupportsThinkingDisplay,
+  type CliVersion,
+} from "./cli-version.js"
 
 export interface ActiveProcess {
   proc: ChildProcess
@@ -31,6 +36,39 @@ const claudeSessions = new Map<string, string>()
 // one-per-chat, so an unbounded map would leak processes as users open new
 // chats. This caps at a reasonable working-set and evicts the oldest.
 const MAX_ACTIVE_PROCESSES = 16
+
+function envFlagEnabled(value: string | undefined): boolean {
+  if (value === undefined) return false
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return false
+  return !["0", "false", "no", "off"].includes(normalized)
+}
+
+export function isClaudeThinkingDisabled(): boolean {
+  return (
+    envFlagEnabled(process.env.CLAUDE_CODE_DISABLE_THINKING) ||
+    envFlagEnabled(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING)
+  )
+}
+
+export function claudeSpawnEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    TERM: "xterm-256color",
+  }
+
+  // Default-on thinking summaries for opus-4-7 (which omits thinking by
+  // default on the CLI side). Any var the user has explicitly set in their
+  // shell is passed through untouched; the plugin only fills in the default.
+  if (
+    !isClaudeThinkingDisabled() &&
+    process.env.CLAUDE_CODE_SHOW_THINKING_SUMMARIES === undefined
+  ) {
+    env.CLAUDE_CODE_SHOW_THINKING_SUMMARIES = "1"
+  }
+
+  return env
+}
 
 function touch(key: string): void {
   const existing = activeProcesses.get(key)
@@ -95,7 +133,7 @@ export function spawnClaudeProcess(
   const proc = spawn(cliPath, cliArgs, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, TERM: "xterm-256color" },
+    env: claudeSpawnEnv(),
     shell: process.platform === "win32",
   })
 
@@ -171,6 +209,9 @@ export function buildCliArgs(opts: {
   strictMcpConfig?: boolean
   disallowedTools?: string[]
   appendSystemPromptFile?: string
+  thinking?: "enabled" | "disabled"
+  thinkingDisplay?: "summarized" | "omitted"
+  cliVersion?: CliVersion | null
 }): string[] {
   const {
     sessionKey,
@@ -182,6 +223,9 @@ export function buildCliArgs(opts: {
     strictMcpConfig,
     disallowedTools,
     appendSystemPromptFile,
+    thinking,
+    thinkingDisplay,
+    cliVersion,
   } = opts
   const args = [
     "--print",
@@ -222,6 +266,21 @@ export function buildCliArgs(opts: {
 
   if (disallowedTools && disallowedTools.length > 0) {
     args.push("--disallowedTools", ...disallowedTools)
+  }
+
+  // `--thinking` is only present from Claude Code 2.x onward; gate so
+  // pre-2.x binaries don't crash with a parse error. Unknown version →
+  // skip (the spawn still works, the user just doesn't get extended
+  // thinking until they upgrade).
+  if (thinking && cliSupportsThinking(cliVersion ?? null)) {
+    args.push("--thinking", thinking)
+  }
+
+  // `--thinking-display` was added in Claude Code 2.1.142. Older CLIs
+  // reject it with a parse error, so gate on detected version. When
+  // version is unknown (detection failed), be conservative and skip.
+  if (thinkingDisplay && cliSupportsThinkingDisplay(cliVersion ?? null)) {
+    args.push("--thinking-display", thinkingDisplay)
   }
 
   if (appendSystemPromptFile) {

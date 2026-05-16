@@ -107,11 +107,105 @@ function getToolResultText(part: any): string {
   }
 }
 
+// Compaction-mode caps. These are the only knobs that affect how much
+// transcript content reaches the model when opencode invokes /compact.
+// 180k chars ≈ 60k tokens worst-case — well under Haiku 4.5's 200k window
+// after accounting for system prompt + output budget.
+const MAX_HISTORY_CHARS = 180_000
+const MAX_TOOL_RESULT_CHARS = 10_000
+const MAX_TOOL_INPUT_CHARS = 2_000
+
+function clipWithMarker(text: string, max: number): string {
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`
+}
+
+function renderToolInput(input: unknown): string {
+  let raw: string
+  try {
+    raw = typeof input === "string" ? input : JSON.stringify(input)
+  } catch {
+    raw = String(input)
+  }
+  return clipWithMarker(raw, MAX_TOOL_INPUT_CHARS)
+}
+
+function renderMessageContentForCompaction(
+  msg: any,
+): { text: string; toolResultCount: number } {
+  const lines: string[] = []
+  let toolResultCount = 0
+
+  if (typeof msg.content === "string") {
+    return { text: msg.content, toolResultCount: 0 }
+  }
+
+  if (!Array.isArray(msg.content)) {
+    return { text: "", toolResultCount: 0 }
+  }
+
+  for (const part of msg.content as any[]) {
+    if (!part) continue
+    switch (part.type) {
+      case "text":
+        if (part.text) lines.push(part.text)
+        break
+      case "tool-call":
+        lines.push(
+          `[tool_use:${part.toolName ?? "unknown"}(${renderToolInput(part.input)})]`,
+        )
+        break
+      case "tool-result":
+        toolResultCount++
+        lines.push(
+          `[tool_result:${part.toolName ?? part.toolCallId ?? "unknown"}]\n${clipWithMarker(
+            getToolResultText(part),
+            MAX_TOOL_RESULT_CHARS,
+          )}`,
+        )
+        break
+      case "image":
+        lines.push(
+          `[image: ${part.mediaType ?? part.mimeType ?? "unknown"}]`,
+        )
+        break
+      case "file":
+        lines.push(
+          `[file: ${part.mediaType ?? part.mimeType ?? "unknown"}]`,
+        )
+        break
+      case "reasoning":
+        // Skip reasoning blocks in compaction — they bloat input without
+        // helping the summarizer.
+        break
+    }
+  }
+
+  return { text: lines.join("\n"), toolResultCount }
+}
+
 /**
- * Compact conversation history into a context summary for when we start
- * a fresh Claude CLI session but want to preserve conversation context.
+ * Compact conversation history into a context summary.
+ *
+ * - mode "fresh-session" (default): legacy behavior. Filters to
+ *   user/assistant only, clips each message at 2000 chars, drops tool
+ *   payloads to placeholders. Used when starting a fresh CLI session
+ *   that lost its prior session id.
+ * - mode "compaction": rich serializer for opencode /compact. Includes
+ *   tool roles, renders tool_use input and tool_result content (each
+ *   clipped at MAX_TOOL_RESULT_CHARS), and caps aggregate output at
+ *   MAX_HISTORY_CHARS by dropping oldest entries first.
  */
-export function compactConversationHistory(prompt: Prompt): string | null {
+export function compactConversationHistory(
+  prompt: Prompt,
+  opts: { mode?: "fresh-session" | "compaction" } = {},
+): string | null {
+  const mode = opts.mode ?? "fresh-session"
+
+  if (mode === "compaction") {
+    return buildCompactionHistory(prompt)
+  }
+
   const conversationMessages = prompt.filter(
     (m) => m.role === "user" || m.role === "assistant",
   )
@@ -164,17 +258,99 @@ export function compactConversationHistory(prompt: Prompt): string | null {
   return historyParts.join("\n\n")
 }
 
+function buildCompactionHistory(prompt: Prompt): string | null {
+  // Iterate newest-first, accumulate up to MAX_HISTORY_CHARS, then reverse
+  // to chronological order. Oldest messages get dropped when the budget
+  // is exhausted — they are the least relevant for a summary of recent
+  // work.
+  const entries: string[] = []
+  let total = 0
+  let totalToolResults = 0
+  let droppedOldest = 0
+
+  // Skip the trailing user message: opencode's /compact appends the
+  // synthesis instruction as the final user turn. The instruction itself
+  // is added by getClaudeUserMessage after the transcript block, so we
+  // don't want it duplicated inside the transcript.
+  const end = prompt.length > 0 && prompt[prompt.length - 1].role === "user"
+    ? prompt.length - 1
+    : prompt.length
+
+  for (let i = end - 1; i >= 0; i--) {
+    const msg = prompt[i] as any
+    const roleLabel =
+      msg.role === "user"
+        ? "User"
+        : msg.role === "assistant"
+          ? "Assistant"
+          : msg.role === "tool"
+            ? "Tool"
+            : msg.role
+
+    const { text, toolResultCount } = renderMessageContentForCompaction(msg)
+    if (!text.trim()) continue
+
+    const entry = `${roleLabel}: ${text}`
+    if (total + entry.length > MAX_HISTORY_CHARS) {
+      droppedOldest = i + 1
+      break
+    }
+    entries.push(entry)
+    total += entry.length + 2 // +2 for the "\n\n" join
+    totalToolResults += toolResultCount
+  }
+
+  if (entries.length === 0) return null
+
+  entries.reverse()
+  log.info("built compaction history", {
+    entries: entries.length,
+    chars: total,
+    toolResults: totalToolResults,
+    droppedOldestBefore: droppedOldest,
+  })
+
+  return entries.join("\n\n")
+}
+
 /**
  * Convert AI SDK prompt into a Claude CLI stream-json user message.
+ *
+ * `compactionMode` switches behavior for opencode /compact: the prior
+ * transcript is rendered with rich tool content (not placeholders), the
+ * wrapper framing tells the model this is the authoritative thread, and
+ * the reasoning keyword is suppressed so the full output budget goes
+ * toward the summary.
  */
 export function getClaudeUserMessage(
   prompt: Prompt,
   includeHistoryContext: boolean = false,
   reasoningEffort?: ReasoningEffort,
+  opts: { compactionMode?: boolean } = {},
 ): string {
+  const compactionMode = opts.compactionMode === true
   const content: any[] = []
 
-  if (includeHistoryContext) {
+  if (compactionMode) {
+    const transcript = compactConversationHistory(prompt, {
+      mode: "compaction",
+    })
+    if (transcript) {
+      log.info("including compaction transcript", {
+        historyLength: transcript.length,
+      })
+      content.push({
+        type: "text",
+        text: `<conversation_transcript>
+${transcript}
+</conversation_transcript>
+
+The complete prior conversation appears above. The synthesis instructions follow below.
+
+`,
+      })
+    }
+  } else if (includeHistoryContext) {
     const historyContext = compactConversationHistory(prompt)
     if (historyContext) {
       log.info("including conversation history context", {
@@ -272,17 +448,22 @@ Now continuing with the current message:
     })
   }
 
-  const keyword = reasoningKeyword(reasoningEffort)
-  if (keyword) {
-    const lastTextPart = [...content].reverse().find((p) => p.type === "text")
-    if (lastTextPart) {
-      lastTextPart.text = lastTextPart.text
-        ? `${lastTextPart.text}\n\n(${keyword})`
-        : `(${keyword})`
-    } else {
-      content.push({ type: "text", text: `(${keyword})` })
+  // Reasoning keyword is a Claude CLI hint that triggers extended thinking.
+  // For compaction we want the full output budget to go to the summary
+  // itself, not internal reasoning — so skip injection.
+  if (!compactionMode) {
+    const keyword = reasoningKeyword(reasoningEffort)
+    if (keyword) {
+      const lastTextPart = [...content].reverse().find((p) => p.type === "text")
+      if (lastTextPart) {
+        lastTextPart.text = lastTextPart.text
+          ? `${lastTextPart.text}\n\n(${keyword})`
+          : `(${keyword})`
+      } else {
+        content.push({ type: "text", text: `(${keyword})` })
+      }
+      log.debug("injected reasoning keyword", { effort: reasoningEffort, keyword })
     }
-    log.debug("injected reasoning keyword", { effort: reasoningEffort, keyword })
   }
 
   return JSON.stringify({

@@ -129,3 +129,213 @@ test("mixed user-text + tool-role both flow into the same content array", () => 
   const textBlock = blocks.find((b: any) => b.type === "text")
   assert.notEqual(textBlock.text, "(empty)")
 })
+
+// ---------------------------------------------------------------------------
+// Compaction mode tests
+// ---------------------------------------------------------------------------
+
+function parsedCompaction(prompt: any) {
+  return JSON.parse(
+    getClaudeUserMessage(prompt as any, false, undefined, {
+      compactionMode: true,
+    }),
+  )
+}
+
+test("compaction wraps transcript in <conversation_transcript> tag", () => {
+  const out = parsedCompaction(
+    p([
+      { role: "user", content: "what's 2+2?" },
+      { role: "assistant", content: [{ type: "text", text: "4" }] },
+      {
+        role: "user",
+        content: [{ type: "text", text: "summarize this conversation" }],
+      },
+    ]),
+  )
+
+  const blocks = out.message.content
+  const textBlock = blocks.find((b: any) => b.type === "text")
+  assert.ok(textBlock, "expected a text block")
+  assert.ok(
+    textBlock.text.includes("<conversation_transcript>"),
+    "expected transcript wrapper",
+  )
+  assert.ok(
+    textBlock.text.includes("</conversation_transcript>"),
+    "expected closing transcript tag",
+  )
+  assert.ok(
+    !textBlock.text.includes("from a previous session that couldn't be resumed"),
+    "should not use the fresh-session wrapper text",
+  )
+})
+
+test("compaction transcript includes tool_use input, not just count", () => {
+  const out = parsedCompaction(
+    p([
+      { role: "user", content: "list files" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "running ls" },
+          {
+            type: "tool-call",
+            toolCallId: "call_1",
+            toolName: "Bash",
+            input: { command: "ls -la /tmp/specific-path" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "Bash",
+            output: {
+              type: "text",
+              value: "file1.txt\nfile2.txt\nspecific-content-here",
+            },
+          },
+        ],
+      },
+      { role: "user", content: "summarize" },
+    ]),
+  )
+
+  const transcript = out.message.content.find((b: any) => b.type === "text").text
+  assert.ok(
+    transcript.includes("tool_use:Bash"),
+    "expected rendered tool_use with name",
+  )
+  assert.ok(
+    transcript.includes("ls -la /tmp/specific-path"),
+    "expected tool input rendered, not placeholder",
+  )
+  assert.ok(
+    transcript.includes("specific-content-here"),
+    "expected tool_result content rendered, not placeholder",
+  )
+  // Legacy placeholder text must NOT appear in compaction mode.
+  assert.ok(
+    !transcript.includes("[Called 1 tool(s)"),
+    "should not use legacy placeholder",
+  )
+  assert.ok(
+    !transcript.includes("[Received 1 tool result(s)]"),
+    "should not use legacy placeholder",
+  )
+})
+
+test("compaction clips long tool_result with truncation marker", () => {
+  const longOutput = "x".repeat(15_000)
+  const out = parsedCompaction(
+    p([
+      { role: "user", content: "do thing" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call_1",
+            toolName: "Read",
+            input: { file: "big.txt" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "Read",
+            output: { type: "text", value: longOutput },
+          },
+        ],
+      },
+      { role: "user", content: "summarize" },
+    ]),
+  )
+
+  const transcript = out.message.content.find((b: any) => b.type === "text").text
+  assert.ok(
+    transcript.includes("[truncated"),
+    "expected truncation marker for over-cap tool_result",
+  )
+  // Bounded: must not contain the full 15k blob.
+  assert.ok(
+    transcript.length < 14_000,
+    `transcript should be capped near 10k chars per tool_result, got ${transcript.length}`,
+  )
+})
+
+test("compaction final user instruction follows the transcript", () => {
+  const out = parsedCompaction(
+    p([
+      { role: "user", content: "what's up" },
+      { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "Your task is to summarize the conversation.",
+          },
+        ],
+      },
+    ]),
+  )
+
+  const blocks = out.message.content
+  // Expect: [transcript-text-block, instruction-text-block]
+  const texts = blocks.filter((b: any) => b.type === "text").map((b: any) => b.text)
+  assert.equal(texts.length, 2, `expected 2 text blocks, got ${texts.length}`)
+  assert.ok(texts[0].includes("<conversation_transcript>"))
+  assert.ok(texts[1].includes("Your task is to summarize"))
+  // Synthesis instruction must NOT be embedded inside the transcript block.
+  assert.ok(!texts[0].includes("Your task is to summarize"))
+})
+
+test("compaction suppresses reasoning keyword injection", () => {
+  const out = JSON.parse(
+    getClaudeUserMessage(
+      p([
+        { role: "user", content: "anything" },
+        { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        { role: "user", content: [{ type: "text", text: "summarize" }] },
+      ]) as any,
+      false,
+      "max",
+      { compactionMode: true },
+    ),
+  )
+  const texts = out.message.content
+    .filter((b: any) => b.type === "text")
+    .map((b: any) => b.text)
+    .join("\n")
+  assert.ok(
+    !texts.includes("(ultrathink)"),
+    "reasoning keyword should be suppressed in compaction mode",
+  )
+})
+
+test("non-compaction call still injects reasoning keyword", () => {
+  const out = JSON.parse(
+    getClaudeUserMessage(
+      p([{ role: "user", content: "hello" }]) as any,
+      false,
+      "max",
+    ),
+  )
+  const texts = out.message.content
+    .filter((b: any) => b.type === "text")
+    .map((b: any) => b.text)
+    .join("\n")
+  assert.ok(
+    texts.includes("(ultrathink)"),
+    "reasoning keyword should still be injected for normal turns",
+  )
+})

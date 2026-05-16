@@ -79,6 +79,7 @@ export function createClaudeCode(
       multiStepContinuation: settings.multiStepContinuation ?? true,
       autoContinueIncompleteTurns:
         settings.autoContinueIncompleteTurns ?? "smart",
+      compactionModel: settings.compactionModel,
     })
   }
 
@@ -362,6 +363,35 @@ const server: OpenCodePlugin = async (input) => {
     provider: {
       id: PROVIDER_ID,
       models: async (provider) => defaultModelsForProvider(provider.models),
+    },
+    // Inject opencode's agent name into providerOptions so the language
+    // model can distinguish /compact (and title) calls from normal turns.
+    // Without this, every no-tools call looks like a title request and
+    // gets short-circuited to a synthetic stub.
+    "chat.params": async (input, output) => {
+      const providerID = input.model?.providerID ?? input.provider?.info?.id
+      // The hook fires for every provider opencode is configured with, not
+      // just ours — keep this at debug to avoid log spam on non-claude-code
+      // calls.
+      log.debug("chat.params hook fired", {
+        agent: input.agent,
+        providerID,
+        sessionID: input.sessionID,
+      })
+      if (typeof providerID !== "string") return
+      if (providerID !== PROVIDER_ID && !providerID.startsWith(`${PROVIDER_ID}-`)) return
+      if (!input.agent) return
+      // opencode wraps the entire `output.options` bag under the providerID
+      // via ProviderTransform.providerOptions(model, options) → { [providerID]: options }
+      // before handing it to the language model as `providerOptions`. So we
+      // write fields at the TOP LEVEL of output.options, not nested under
+      // providerID — otherwise the model sees providerOptions[id][id].opencodeAgent.
+      output.options ??= {}
+      ;(output.options as Record<string, unknown>).opencodeAgent = input.agent
+      log.debug("chat.params tagged providerOptions", {
+        agent: input.agent,
+        providerID,
+      })
     },
   }
 }

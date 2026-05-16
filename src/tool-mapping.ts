@@ -86,10 +86,20 @@ const OPENCODE_HANDLED_TOOLS = new Set([
 
 // Claude CLI internal tools that should not be forwarded to opencode.
 // These are part of Claude Code's own system and have no opencode equivalent.
+// Tools the Claude CLI emits for its own internal bookkeeping (sub-agents,
+// task tracking, search). opencode has no matching tool registry entry, so
+// forwarding them surfaces as `⚙ invalid` rows in the UI. Skip them.
+// TaskOutput is intentionally NOT here — it has an explicit bash-echo mapping
+// below so the result stays visible.
 const CLAUDE_INTERNAL_TOOLS = new Set([
   "ToolSearch",
   "Agent",
   "AskFollowupQuestion",
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskList",
+  "TaskGet",
+  "TaskStop",
 ])
 
 export function mapTool(

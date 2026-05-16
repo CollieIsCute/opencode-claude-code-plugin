@@ -173,6 +173,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `webSearch` | `"claude"` \| `"disabled"` \| `<tool>` | `"claude"` | Routing for Claude's built-in `WebSearch`. See [WebSearch routing](#websearch-routing). |
 | `multiStepContinuation` | boolean | `true` | Append a system-prompt hint nudging Claude to chain tool calls within one turn instead of pausing between subtasks. Each opencode turn boundary requires the user to manually press "continue", so for multi-step tasks this reduces friction. Set `false` to disable. |
 | `autoContinueIncompleteTurns` | boolean \| `"smart"` | `"smart"` | Smartly continue incomplete Claude CLI results inside the same opencode turn. Reduces manual "continue" presses when Claude ends after reasoning/tool activity without a useful final answer. Set `false` to disable. |
+| `compactionModel` | string | `"claude-haiku-4-5"` | Model used when opencode invokes `/compact`. Override per-process via the `CLAUDE_CODE_COMPACTION_MODEL` env var (env wins over config). See [Compaction](#compaction). |
 
 ### Overriding model metadata
 
@@ -309,6 +310,50 @@ Set `permissionMode: "plan"` to forward `--permission-mode plan` to Claude. The 
 
 ---
 
+## Compaction
+
+When you run `/compact` in opencode, the plugin handles it on a short-lived dedicated Claude CLI spawn instead of routing it through your main conversation process. Three reasons:
+
+1. **Cost.** The summarizer reads your entire transcript every time. Routing through a smaller model keeps `/compact` from burning your Opus budget.
+2. **Latency.** Claude Haiku 4.5 hits ~150 tok/s with a hard 8k output cap, so compaction completes predictably (~30s for a long transcript).
+3. **Cleanliness.** The compaction spawn skips MCP servers, the tool proxy, and the multi-step continuation hint. It's a one-shot text-out call; the rest is overhead.
+
+The transcript itself is serialized rich: tool inputs and tool results are both included (each clipped at 10k chars), with oldest entries dropped first when the aggregate exceeds 180k chars. The summarizer sees actual tool activity rather than placeholders.
+
+### Picking a different compaction model
+
+| Source | How | Wins over |
+|---|---|---|
+| Env var (per-process) | `CLAUDE_CODE_COMPACTION_MODEL=claude-sonnet-4-6 opencode` | config, default |
+| `opencode.json` (per-project) | `"compactionModel": "claude-sonnet-4-6"` under `provider.claude-code.options` | default |
+| Default | `claude-haiku-4-5` | – |
+
+Anything Claude Code's `--model` accepts works as a value.
+
+---
+
+## Extended thinking
+
+The plugin forwards Claude's thinking blocks (`thinking_delta` stream events) to opencode as reasoning parts, so the "Thinking" row in the chat panel shows whenever the model uses extended thinking. This works across every Claude 4 family model the CLI supports.
+
+What you see is a **summary** of the model's thinking, not the raw chain-of-thought. Anthropic [stopped exposing raw thinking on the Claude 4 family](https://platform.claude.com/docs/en/build-with-claude/extended-thinking#summarized-thinking) and ships a server-generated digest instead. For Claude Opus 4.7 specifically, [thinking content is omitted from responses by default](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default); the plugin opts back in by passing `--thinking-display summarized` on every spawn. Claude Code CLI 2.1.142+ is required for that flag to take effect; older CLIs skip it silently.
+
+### Reasoning effort variants
+
+Each model exposes `low` / `medium` / `high` / `xhigh` / `max` variants. Picking one injects the corresponding Claude CLI thinking keyword (e.g. `(ultrathink)` for `max`) into the user message. Compaction calls skip this injection so the full output budget goes to the summary.
+
+### Env-var overrides
+
+The plugin respects the standard Claude Code thinking env vars. If you set them in your shell, they pass through to the spawned process untouched.
+
+| Env var | Effect |
+|---|---|
+| `CLAUDE_CODE_DISABLE_THINKING=1` | Disable thinking entirely. |
+| `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` | Disable adaptive thinking only. |
+| `CLAUDE_CODE_SHOW_THINKING_SUMMARIES=0` | Suppress summaries (the plugin sets this to `1` by default when unset). |
+
+---
+
 ## Quirks worth knowing
 
 - **Empty text blocks are dropped.** Claude sometimes opens a `content_block_start` for text but never sends a delta. The plugin no longer emits the empty block (which was triggering Anthropic 400s like `cache_control cannot be set for empty text blocks`).
@@ -385,8 +430,8 @@ plugin internals.
 ## Known limitations
 
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
-- No interleaved thinking — Claude Code CLI doesn't expose reasoning tokens to the SDK.
-- The CLI must be a recent enough version to support `--mcp-config` and `--disallowedTools`. If something breaks after a Claude Code update, that's the first thing to check.
+- Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
+- Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
 
 ---
 
@@ -405,9 +450,11 @@ src/
   index.ts                       # opencode plugin entry, config + provider hooks
   models.ts                      # default models + variants
   claude-code-language-model.ts  # AI-SDK provider that drives `claude`
+  message-builder.ts             # AI-SDK prompt → Claude CLI user message
   proxy-mcp.ts                   # in-process MCP server for proxied tools
   mcp-bridge.ts                  # opencode → Claude --mcp-config translator
   session-manager.ts             # LRU cache of CLI subprocesses
+  cli-version.ts                 # detect Claude CLI version, gate optional flags
   logger.ts                      # DEBUG=opencode-claude-code stderr logger
   types.ts                       # public option types
   opencode-types.ts              # mirrored opencode types

@@ -23,6 +23,7 @@ export interface ClaudeCodeConfig {
   proxyOpencodeMcpTools?: boolean
   multiStepContinuation?: boolean
   autoContinueIncompleteTurns?: boolean | "smart"
+  compactionModel?: string
   logging?: LoggingConfig
 }
 
@@ -179,6 +180,15 @@ export interface ClaudeCodeProviderSettings {
    * Set to `false` to disable.
    */
   autoContinueIncompleteTurns?: boolean | "smart"
+
+  /**
+   * Model id used when opencode invokes `/compact`. Defaults to
+   * `claude-haiku-4-5` — fast, cheap, strong structured summarizer. Set
+   * to override per-project in `opencode.json` / `opencode.jsonc`; the
+   * `CLAUDE_CODE_COMPACTION_MODEL` env var overrides this in turn for
+   * one-off runs without editing config.
+   */
+  compactionModel?: string
 
   /**
    * Logger configuration. See `LoggingConfig` for fields. Env vars
