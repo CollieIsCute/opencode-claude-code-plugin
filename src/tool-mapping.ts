@@ -1,8 +1,11 @@
 import { log } from "./logger.js"
+import { applyTaskCreateToolUse, applyTaskUpdate, type TodoEntry } from "./todo-ledger.js"
 import type { WebSearchRouting } from "./types.js"
 
 export interface MapToolOptions {
   webSearch?: WebSearchRouting
+  sessionId?: string
+  toolUseId?: string
 }
 
 /**
@@ -95,12 +98,25 @@ const CLAUDE_INTERNAL_TOOLS = new Set([
   "ToolSearch",
   "Agent",
   "AskFollowupQuestion",
-  "TaskCreate",
-  "TaskUpdate",
   "TaskList",
   "TaskGet",
   "TaskStop",
 ])
+
+function emitTodoWrite(todos: TodoEntry[]) {
+  return {
+    name: "todowrite",
+    input: {
+      todos: todos.map((todo) => ({
+        id: todo.id,
+        content: todo.content,
+        status: todo.status,
+        priority: "medium",
+      })),
+    },
+    executed: false,
+  }
+}
 
 export function mapTool(
   name: string,
@@ -112,6 +128,28 @@ export function mapTool(
     log.debug("skipping Claude CLI internal tool", { name })
     return { name, input, executed: true, skip: true }
   }
+
+  // TaskCreate: stash subject keyed by tool_use_id; emission happens on tool_result.
+  // Without sessionId+toolUseId we cannot maintain the ledger, so fall back to skip
+  // (preserves old behavior for callers that haven't been threaded yet).
+  if (name === "TaskCreate") {
+    if (opts?.sessionId && opts?.toolUseId) {
+      applyTaskCreateToolUse(opts.sessionId, opts.toolUseId, input)
+    }
+    return { name, input, executed: true, skip: true }
+  }
+
+  // TaskUpdate: mutate ledger and emit full list as opencode todowrite. Without
+  // sessionId, fall back to skip. Unknown task ids return null from the ledger
+  // and we drop the event.
+  if (name === "TaskUpdate") {
+    if (opts?.sessionId) {
+      const list = applyTaskUpdate(opts.sessionId, input)
+      if (list !== null) return emitTodoWrite(list)
+    }
+    return { name, input, executed: true, skip: true }
+  }
+
   // Plan mode tools
   if (name === "EnterPlanMode") return { name: "plan_enter", input: {}, executed: false }
   if (name === "ExitPlanMode") return { name: "plan_exit", input, executed: false }

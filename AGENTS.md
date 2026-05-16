@@ -36,7 +36,8 @@
 - Respect user Claude Code env vars. Do not delete or override `CLAUDE_CODE_DISABLE_THINKING`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING`, or explicit `CLAUDE_CODE_SHOW_THINKING_SUMMARIES` values.
 - Reasoning stream parts are only started after the first non-empty `thinking_delta`. This prevents empty Thinking rows when the CLI opens a thinking block but streams no text.
 - `signature_delta` is expected encrypted thinking metadata. Ignore it quietly; do not treat it as an error.
-- Claude CLI emits internal tools (`Agent`, `ToolSearch`, `AskFollowupQuestion`, `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`, `TaskStop`) that have no opencode registry entry. They live in `CLAUDE_INTERNAL_TOOLS` in `src/tool-mapping.ts` and must be skipped, not forwarded. Forwarding them surfaces `⚙ invalid` tool rows in opencode. `TaskOutput` is the exception: it stays mapped to a `bash echo` so the result is visible.
+- Claude CLI emits internal tools (`Agent`, `ToolSearch`, `AskFollowupQuestion`, `TaskList`, `TaskGet`, `TaskStop`) that have no opencode registry entry. They live in `CLAUDE_INTERNAL_TOOLS` in `src/tool-mapping.ts` and must be skipped, not forwarded. Forwarding them surfaces `⚙ invalid` tool rows in opencode. `TaskOutput` is the exception: it stays mapped to a `bash echo` so the result is visible. `TaskCreate` and `TaskUpdate` are NOT in this set — they route through the todo ledger (see next gotcha).
+- Todo ledger translates Claude CLI's granular `TaskCreate`/`TaskUpdate` family into opencode's full-list `todowrite` so the opencode todo panel populates during multi-step Claude work. State lives in `src/todo-ledger.ts`, keyed by Claude CLI session id, cleared via `clearLedger` from `deleteClaudeSessionId` in `session-manager.ts`. TaskCreate stashes pending by `tool_use_id` on tool_use and commits on tool_result (parsed via `/Task\s*#?\s*(\d+)\s+created/i`); TaskUpdate mutates in place. Without `sessionId` in `MapToolOptions`, both fall back to `{skip: true}` to preserve safety for callers that haven't been threaded. Tests live in `test-todo-ledger.ts` and `test-tool-mapping.ts`; live UI verification requires a fresh opencode session with a multi-step Claude task.
 - Verified compatible with opencode v1.15.0 (audit 2026-05-16). `ProviderV2` hook gained an optional `ctx` arg we ignore; `McpStatus` expanded to 5 variants but `enabled: status === "connected"` in `mcp-bridge.ts` still collapses non-connected to `false` correctly. opencode's `tools` argument to `doStream` is intentionally unused — Claude CLI only sees its own built-ins plus MCP servers bridged via `--mcp-config`, so opencode-native tools like `task_status` never reach the model and need no `mapTool` entry. Re-audit at the next opencode minor bump.
 - `cwd` resolution at spawn must stay lazy. `opencodeProjectDirectory` captured from `PluginInput.directory` lives in `runtime-status.ts` and is consumed via `resolveSpawnCwd()` at spawn time only as a fallback when `process.cwd()` is unusable (`/`). Do NOT bake the captured value into `mergedOptions.cwd` during provider registration in `index.ts` — that freezes it at plugin init and breaks workspace switching mid-session. The v0.2.4 fix did exactly this and it shipped as the v0.4.21 regression report on issue #4. Tests live in `test-cwd-resolution.ts`.
 
@@ -45,6 +46,7 @@
 - Prompt/message conversion or compaction transcript behavior: `test-get-claude-user-message.ts`.
 - Claude CLI arg construction / version-gated flags: `test-cli-args.ts`.
 - Tool name/input mapping (`mapTool`, `CLAUDE_INTERNAL_TOOLS`): `test-tool-mapping.ts`.
+- Todo ledger (Task* → todowrite translation, TTL pruning, multi-session isolation): `test-todo-ledger.ts`.
 - MCP bridge/proxy behavior: `test-bridge.ts`, `test-broker.ts`.
 - Auto-continue / incomplete turn handling: `test-auto-continue.ts`, `test-has-new-user-content.ts`.
 - Logger/env behavior: `test-logger.ts`.
@@ -52,4 +54,4 @@
 
 ## Known Follow-ups
 
-- **Translate Claude CLI `Task*` family into opencode `todowrite` updates** (deferred). Today these are skipped via `CLAUDE_INTERNAL_TOOLS` so they don't render as `⚙ invalid`, but the user also doesn't see them in the opencode todo panel. If the CLI's system prompting shifts to prefer `Task*` over `TodoWrite` and the todo panel starts coming up empty, build a per-session task ledger in `src/tool-mapping.ts` (Claude emits granular create/update/stop; opencode's `todowrite` expects the full list each call) and re-emit as `todowrite` on each mutation. Requires status-field mapping, id strategy, ledger cleanup on session end/compaction, and live UI verification — `npm test` won't cover the panel rendering. Rough estimate: 1-3 hours.
+- (none currently open)

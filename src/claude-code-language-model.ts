@@ -15,6 +15,7 @@ import type {
   ReasoningEffort,
 } from "./types.js"
 import { mapTool } from "./tool-mapping.js"
+import { applyTaskCreateToolResult } from "./todo-ledger.js"
 import { getClaudeUserMessage } from "./message-builder.js"
 import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
 import {
@@ -1338,7 +1339,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         input: mappedInput,
         executed,
         skip,
-      } = mapTool(tc.name, tc.args, { webSearch: this.config.webSearch })
+      } = mapTool(tc.name, tc.args, {
+        webSearch: this.config.webSearch,
+        sessionId: getClaudeSessionId(sk),
+        toolUseId: tc.id,
+      })
       if (skip) continue
       content.push({
         type: "tool-call",
@@ -1956,7 +1961,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   const { name: mappedName, skip, executed } = mapTool(
                     block.name,
                     undefined,
-                    { webSearch: self.config.webSearch },
+                    {
+                      webSearch: self.config.webSearch,
+                      sessionId: getClaudeSessionId(sk),
+                      toolUseId: block.id,
+                    },
                   )
                   if (!skip) {
                     controller.enqueue({
@@ -2113,7 +2122,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     input: mappedInput,
                     executed,
                     skip,
-                  } = mapTool(tc.name, parsedInput, { webSearch: self.config.webSearch })
+                  } = mapTool(tc.name, parsedInput, {
+                    webSearch: self.config.webSearch,
+                    sessionId: getClaudeSessionId(sk),
+                    toolUseId: tc.id,
+                  })
 
                   if (!skip) {
                     toolCallsById.set(tc.id, {
@@ -2324,7 +2337,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                       input: mappedInput,
                       executed,
                       skip,
-                    } = mapTool(block.name, parsedInput, { webSearch: self.config.webSearch })
+                    } = mapTool(block.name, parsedInput, {
+                      webSearch: self.config.webSearch,
+                      sessionId: getClaudeSessionId(sk),
+                      toolUseId: block.id,
+                    })
 
                     if (!skip) {
                       if (!executed) skipResultForIds.add(block.id)
@@ -2369,24 +2386,61 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     })
                     continue
                   }
+
+                  let resultText = ""
+                  if (typeof block.content === "string") {
+                    resultText = block.content
+                  } else if (Array.isArray(block.content)) {
+                    resultText = block.content
+                      .filter(
+                        (
+                          c,
+                        ): c is { type: string; text: string } =>
+                          c.type === "text" &&
+                          typeof c.text === "string",
+                      )
+                      .map((c) => c.text)
+                      .join("\n")
+                  }
+
+                  // Ledger hook: commit pending TaskCreate to opencode's todo
+                  // panel via a synthetic todowrite emission. Pass-through —
+                  // returns null for non-TaskCreate ids, so cheap and silent.
+                  const claudeSessionId = getClaudeSessionId(sk)
+                  if (claudeSessionId) {
+                    const list = applyTaskCreateToolResult(
+                      claudeSessionId,
+                      block.tool_use_id,
+                      resultText,
+                    )
+                    if (list) {
+                      const synthId = `todowrite_${block.tool_use_id}`
+                      controller.enqueue({
+                        type: "tool-input-start",
+                        id: synthId,
+                        toolName: "todowrite",
+                        providerExecuted: false,
+                      } as any)
+                      controller.enqueue({
+                        type: "tool-call",
+                        toolCallId: synthId,
+                        toolName: "todowrite",
+                        input: JSON.stringify({
+                          todos: list.map((t) => ({
+                            id: t.id,
+                            content: t.content,
+                            status: t.status,
+                            priority: "medium",
+                          })),
+                        }),
+                        providerExecuted: false,
+                      } as any)
+                      noteToolActivity()
+                    }
+                  }
+
                   const toolCall = toolCallsById.get(block.tool_use_id)
                   if (toolCall) {
-                    let resultText = ""
-                    if (typeof block.content === "string") {
-                      resultText = block.content
-                    } else if (Array.isArray(block.content)) {
-                      resultText = block.content
-                        .filter(
-                          (
-                            c,
-                          ): c is { type: string; text: string } =>
-                            c.type === "text" &&
-                            typeof c.text === "string",
-                        )
-                        .map((c) => c.text)
-                        .join("\n")
-                    }
-
                     controller.enqueue({
                       type: "tool-result",
                       toolCallId: block.tool_use_id,
