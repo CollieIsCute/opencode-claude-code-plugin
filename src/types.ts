@@ -109,7 +109,15 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-   * Supported: `bash`, `write`, `edit`, `webfetch`. Leave empty or unset to disable proxying.
+   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`. Leave empty or unset to disable proxying.
+   *
+   * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
+   * opencode's `task` tool, so subagent calls run under opencode's
+   * configured subagent set (build/general/custom) with opencode's
+   * permission and lifecycle handling, instead of Claude CLI's
+   * internal-only general-purpose / Explore / Plan options. The calling
+   * agent must have `permission.task: allow` for the target subagent
+   * (see opencode's agent docs).
    */
   proxyTools?: string[]
 

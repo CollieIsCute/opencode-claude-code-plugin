@@ -213,8 +213,11 @@ By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it execut
 | `"Edit"` | `Edit`, `MultiEdit` | `mcp__opencode_proxy__edit` |
 | `"Write"` | `Write` | `mcp__opencode_proxy__write` |
 | `"WebFetch"` | `WebFetch` | `mcp__opencode_proxy__webfetch` |
+| `"Task"` | `Agent` | `mcp__opencode_proxy__task` |
 
-Only those four values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
+The `Task` proxy is the way to let Claude orchestrate opencode's configured subagents (`build`, `general`, custom subagents defined in `opencode.json`) instead of Claude CLI's internal-only general-purpose / Explore / Plan options. With `"Task"` in `proxyTools` and `permission.task: allow` granted to the calling agent, a Claude session can invoke `task(subagent_type="build", prompt="...")` and the subagent runs natively under opencode (with its own permission UI, lifecycle, model assignment, and Tab visibility). Without `"Task"`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode visibility.
+
+Only those five values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
 
 To turn off proxying entirely:
 

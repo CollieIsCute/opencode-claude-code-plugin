@@ -158,6 +158,46 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       required: ["url"],
     },
   },
+  {
+    name: "task",
+    description:
+      "Launch an opencode subagent to handle a complex multi-step task" +
+      " autonomously. Routed through opencode's task tool so subagent" +
+      " orchestration, permission, and lifecycle are handled by opencode." +
+      " Use `subagent_type` to pick which configured subagent runs (e.g." +
+      " `build`, `general`, `explore`, or any custom subagent declared in" +
+      " opencode.json). The call blocks until the subagent finishes; the" +
+      " 10-minute proxy timeout applies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        description: {
+          type: "string",
+          description: "A short (3-5 words) description of the task",
+        },
+        prompt: {
+          type: "string",
+          description: "The task for the agent to perform",
+        },
+        subagent_type: {
+          type: "string",
+          description: "The type of specialized agent to use for this task",
+        },
+        task_id: {
+          type: "string",
+          description:
+            "Set this only if you mean to resume a previous task — pass the" +
+            " prior task_id to continue the same subagent session instead of" +
+            " creating a fresh one.",
+        },
+        command: {
+          type: "string",
+          description: "The command that triggered this task",
+        },
+      },
+      required: ["description", "prompt", "subagent_type"],
+    },
+  },
 ]
 
 export async function createProxyMcpServer(
@@ -435,6 +475,12 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
   // `edit` covers both `Edit` and `MultiEdit` because opencode has no
   // MultiEdit equivalent; without disabling MultiEdit, Claude can batch
   // file changes through it and bypass opencode's permission UI.
+  // `task` disables Claude CLI's `Agent` tool (its built-in subagent
+  // dispatcher) so subagent calls flow through opencode's `task` tool
+  // instead — which lets opencode's configured subagent set (`build`,
+  // `general`, custom subagents in opencode.json) execute the work
+  // under opencode's permission/lifecycle, rather than Claude's
+  // internal-only general-purpose / Explore / Plan options.
   const nameMap: Record<string, string[]> = {
     bash: ["Bash"],
     read: ["Read"],
@@ -443,6 +489,7 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
     glob: ["Glob"],
     grep: ["Grep"],
     webfetch: ["WebFetch"],
+    task: ["Agent"],
   }
   const out: string[] = []
   const seen = new Set<string>()
