@@ -89,6 +89,49 @@ export function resolveCompactionModel(configured?: string): string {
 }
 
 /**
+ * Resolve the session affinity token for a given LLM call. The affinity
+ * token is part of the session key in session-manager so two different
+ * opencode sessions sharing the same cwd+model still get separate Claude
+ * CLI processes.
+ *
+ * Priority:
+ *   1. `x-session-affinity` request header (primary — opencode sets it for
+ *      third-party providers in packages/opencode/src/session/llm.ts).
+ *   2. `opencodeSessionID` inside `providerOptions` (injected by the
+ *      `chat.params` hook in index.ts). Covers cases where the header is
+ *      absent: provider switch mid-session, title synthesis paths, older
+ *      opencode versions. opencode wraps `output.options` under the
+ *      providerID before passing it to the language model, so we look up
+ *      both the configured provider key and the canonical `"claude-code"`.
+ *   3. `"default"` — safe fallback when neither source is available.
+ *
+ * Exported as a free function so it can be unit-tested without
+ * instantiating the language model class.
+ */
+export function resolveSessionAffinity(
+  headers: Record<string, string | undefined> | undefined,
+  providerOptions: Record<string, unknown> | undefined,
+  providerKey: string,
+): string {
+  if (headers) {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "x-session-affinity") {
+        const v = headers[key]
+        if (typeof v === "string" && v.length > 0) return v
+      }
+    }
+  }
+  if (providerOptions) {
+    const bag =
+      (providerOptions as any)[providerKey] ??
+      (providerOptions as any)["claude-code"]
+    const sid = bag?.opencodeSessionID
+    if (typeof sid === "string" && sid.length > 0) return sid
+  }
+  return "default"
+}
+
+/**
  * Stream delta types we handle explicitly. `signature_delta` is listed as
  * known-and-silent: it carries encrypted thinking-block signatures that
  * are opaque to clients (the server uses them to reconstitute thinking
@@ -690,11 +733,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Opencode sets `x-session-affinity: <sessionID>` on LLM calls for
-   * third-party providers (packages/opencode/src/session/llm.ts). Use it so
-   * two chats in the same cwd+model get separate CLI processes instead of
-   * stomping on each other. Falls back to "default" when absent (older
-   * opencode, direct AI-SDK use, title synthesis paths, etc).
+   * Resolve the session affinity token for this LLM call. Delegates to the
+   * exported `resolveSessionAffinity` helper so the logic is unit-testable.
+   * Priority:
+   *   1. `x-session-affinity` request header (primary).
+   *   2. `opencodeSessionID` in providerOptions (chat.params hook fallback —
+   *      covers provider switches mid-session and title synthesis paths
+   *      where the header is absent).
+   *   3. `"default"`.
    */
   private sessionAffinity(
     options: LanguageModelV3CallOptions,
@@ -702,14 +748,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const headers = (options as any)?.headers as
       | Record<string, string | undefined>
       | undefined
-    if (!headers) return "default"
-    for (const key of Object.keys(headers)) {
-      if (key.toLowerCase() === "x-session-affinity") {
-        const v = headers[key]
-        if (typeof v === "string" && v.length > 0) return v
-      }
-    }
-    return "default"
+    return resolveSessionAffinity(
+      headers,
+      options.providerOptions as Record<string, unknown> | undefined,
+      this.config.provider,
+    )
   }
 
   private controlRequestBehaviorForTool(toolName: string): ControlRequestBehavior {

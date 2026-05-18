@@ -378,6 +378,16 @@ const server: OpenCodePlugin = async (input) => {
       })
       if (typeof providerID !== "string") return
       if (providerID !== PROVIDER_ID && !providerID.startsWith(`${PROVIDER_ID}-`)) return
+
+      // Inject sessionID BEFORE the agent guard so session isolation works
+      // even when input.agent is absent (older opencode, provider-switch
+      // edge paths). resolveSessionAffinity reads this as a fallback when
+      // the x-session-affinity header is missing.
+      if (typeof input.sessionID === "string" && input.sessionID.length > 0) {
+        output.options ??= {}
+        ;(output.options as Record<string, unknown>).opencodeSessionID = input.sessionID
+      }
+
       if (!input.agent) return
       // opencode wraps the entire `output.options` bag under the providerID
       // via ProviderTransform.providerOptions(model, options) → { [providerID]: options }
@@ -388,6 +398,7 @@ const server: OpenCodePlugin = async (input) => {
       ;(output.options as Record<string, unknown>).opencodeAgent = input.agent
       log.debug("chat.params tagged providerOptions", {
         agent: input.agent,
+        sessionID: input.sessionID,
         providerID,
       })
     },
