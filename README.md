@@ -313,6 +313,32 @@ Set `permissionMode: "plan"` to forward `--permission-mode plan` to Claude. The 
 
 ---
 
+## AskUserQuestion
+
+opencode has no native structured ask-question executor to proxy through (unlike `Bash`/`Task`), so the plugin handles `AskUserQuestion` specially:
+
+1. **It renders the full question.** The tool's payload — every question, header, option label, and option description — is emitted as readable markdown into the assistant stream so the user actually sees the choices (same approach as `ExitPlanMode`).
+2. **It is never auto-allowed at the CLI gate.** Allowing it would let the headless Claude CLI resolve its own question (no TTY → fabricated/empty answer) and proceed on a guess. `controlRequestBehaviorForTool` hard-denies `AskUserQuestion` and returns a message telling the model to wait for the operator's answer — or, if the run is non-interactive, to proceed with the single most reasonable option and state its assumption rather than stall.
+
+This hard-deny sits **below** `controlRequestToolBehaviors` in precedence but **above** the global `controlRequestBehavior`. So:
+
+- The global `controlRequestBehavior: "allow"` does **not** override it (interactive setups stay correct by default).
+- An explicit per-tool entry **does**. For a fully unattended/automated deployment that prefers "guess and continue" over "stop and wait", restore the old auto-allow:
+
+  ```json
+  "provider": {
+    "claude-code": {
+      "options": {
+        "controlRequestToolBehaviors": { "AskUserQuestion": "allow" }
+      }
+    }
+  }
+  ```
+
+  With `"allow"`, the Claude CLI answers its own `AskUserQuestion` internally and the run never blocks — appropriate only when no operator is watching and forward progress matters more than a correct decision.
+
+---
+
 ## Compaction
 
 When you run `/compact` in opencode, the plugin handles it on a short-lived dedicated Claude CLI spawn instead of routing it through your main conversation process. Three reasons:

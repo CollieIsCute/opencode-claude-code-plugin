@@ -199,6 +199,71 @@ function normalizeVisibleText(text: string): string {
   return text.replace(/\s+/g, " ").trim()
 }
 
+/** Tool names that mean "ask the human a question" (CLI casing variants). */
+function isAskUserQuestionTool(name: string | undefined): boolean {
+  if (!name) return false
+  const n = name.toLowerCase()
+  return n === "askuserquestion" || n === "ask_user_question"
+}
+
+/**
+ * Render Claude Code's `AskUserQuestion` tool input as visible markdown.
+ *
+ * opencode has no native structured ask-question executor to proxy this
+ * through (unlike bash/task), so the question + every option is rendered
+ * as readable assistant text and the user answers in the next turn —
+ * same approach as the `ExitPlanMode` handling. The previous behavior
+ * collapsed the whole payload to a single faint `_Asking: <q>_` line,
+ * dropping all options and any question past the first.
+ */
+function formatAskUserQuestion(input: Record<string, unknown>): string {
+  const anyInput = input as any
+  const questions: any[] = Array.isArray(anyInput?.questions)
+    ? anyInput.questions
+    : []
+
+  if (questions.length === 0) {
+    const single = anyInput?.question ?? anyInput?.text
+    const q =
+      typeof single === "string" && single.trim() ? single.trim() : "Question?"
+    return `\n\n**${q}**\n\n_Reply with your answer to continue._\n\n`
+  }
+
+  const out: string[] = ["\n\n"]
+  const multiQ = questions.length > 1
+  questions.forEach((q, i) => {
+    const text =
+      (typeof q?.question === "string" && q.question.trim()) ||
+      (typeof q?.text === "string" && q.text.trim()) ||
+      "Question?"
+    const header =
+      typeof q?.header === "string" && q.header.trim() ? q.header.trim() : ""
+    out.push(`**${multiQ ? `${i + 1}. ` : ""}${text}**`)
+    if (header) out.push(` _(${header})_`)
+    out.push("\n\n")
+
+    const options: any[] = Array.isArray(q?.options) ? q.options : []
+    options.forEach((opt, j) => {
+      const label =
+        (typeof opt?.label === "string" && opt.label.trim()) ||
+        (typeof opt === "string" && opt.trim()) ||
+        `Option ${j + 1}`
+      const desc =
+        typeof opt?.description === "string" && opt.description.trim()
+          ? ` — ${opt.description.trim()}`
+          : ""
+      out.push(`${j + 1}. **${label}**${desc}\n`)
+    })
+
+    out.push(
+      q?.multiSelect === true
+        ? "\n_Select one or more — reply with the numbers or labels._\n\n"
+        : "\n_Reply with your choice (the number or label)._\n\n",
+    )
+  })
+  return out.join("")
+}
+
 function looksLikeQuestion(text: string): boolean {
   const normalized = normalizeVisibleText(text).toLowerCase()
   if (!normalized) return false
@@ -661,6 +726,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       }
     }
 
+    // AskUserQuestion must never be auto-allowed. Allowing it lets the
+    // Claude CLI resolve its own question internally — in headless mode
+    // there is no TTY, so the CLI fabricates/empties the answer and the
+    // model proceeds on a guess. Deny so the CLI cannot self-answer; the
+    // tool_use is still streamed and rendered to the opencode user by
+    // formatAskUserQuestion, and the turn stops for a real reply. An
+    // explicit controlRequestToolBehaviors entry above can still override.
+    if (isAskUserQuestionTool(toolName)) return "deny"
+
     return this.config.controlRequestBehavior ?? "allow"
   }
 
@@ -716,11 +790,19 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           toolName,
         })
       } else {
+        const denyMessage = isAskUserQuestionTool(toolName)
+          ? "Your question and its options have already been presented to" +
+            " the operator in full. Prefer to stop here and wait for their" +
+            " answer in the next message — do not silently guess. But if" +
+            " this is an automated or otherwise non-interactive run where" +
+            " no operator will reply, do not stall: proceed with the single" +
+            " most reasonable option and state, in one line, the assumption" +
+            " you made so it can be corrected later."
+          : this.config.controlRequestDenyMessage ??
+            `Denied by opencode-claude-code policy for tool ${toolName}`
         this.writeControlResponse(proc, requestId, {
           behavior: "deny",
-          message:
-            this.config.controlRequestDenyMessage ??
-            `Denied by opencode-claude-code policy for tool ${toolName}`,
+          message: denyMessage,
           toolUseID: request.tool_use_id,
         })
         log.info("control request auto-denied", {
@@ -1175,18 +1257,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 thinkingText += block.thinking
               }
               if (block.type === "tool_use" && block.id && block.name) {
-                if (
-                  block.name === "AskUserQuestion" ||
-                  block.name === "ask_user_question"
-                ) {
-                  // Emit question as text
+                if (isAskUserQuestionTool(block.name)) {
+                  // Render the full question + options as visible text so
+                  // the user can actually see and answer it.
                   const parsedInput = (block.input ?? {}) as Record<
                     string,
                     unknown
                   >
-                  const question =
-                    (parsedInput?.question as string) || "Question?"
-                  responseText += `\n\n_Asking: ${question}_\n\n`
+                  responseText += formatAskUserQuestion(parsedInput)
                   continue
                 }
 
@@ -2073,32 +2151,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   parsedInput = JSON.parse(tc.inputJson || "{}")
                 } catch {}
 
-                if (
-                  tc.name === "AskUserQuestion" ||
-                  tc.name === "ask_user_question"
-                ) {
-                  let question = "Question?"
-                  if (
-                    parsedInput?.questions &&
-                    Array.isArray(parsedInput.questions) &&
-                    parsedInput.questions.length > 0
-                  ) {
-                    question =
-                      parsedInput.questions[0].question ||
-                      parsedInput.questions[0].text ||
-                      "Question?"
-                  } else {
-                    question =
-                      parsedInput?.question ||
-                      parsedInput?.text ||
-                      "Question?"
-                  }
-
+                if (isAskUserQuestionTool(tc.name)) {
                   const askId = startTextBlock()
                   controller.enqueue({
                     type: "text-delta",
                     id: askId,
-                    delta: `\n\n_Asking: ${question}_\n\n`,
+                    delta: formatAskUserQuestion(parsedInput),
                   })
                   endTextBlock()
                 } else if (tc.name === "ExitPlanMode") {
@@ -2290,30 +2348,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     input: parsedInput,
                   })
 
-                  if (
-                    block.name === "AskUserQuestion" ||
-                    block.name === "ask_user_question"
-                  ) {
-                    let question = "Question?"
-                    if (
-                      parsedInput?.questions &&
-                      Array.isArray(parsedInput.questions) &&
-                      parsedInput.questions.length > 0
-                    ) {
-                      const q = parsedInput.questions[0] as any
-                      question = q.question || q.text || "Question?"
-                    } else {
-                      question =
-                        (parsedInput?.question as string) ||
-                        (parsedInput?.text as string) ||
-                        "Question?"
-                    }
-
+                  if (isAskUserQuestionTool(block.name)) {
                     const askId = startTextBlock()
                     controller.enqueue({
                       type: "text-delta",
                       id: askId,
-                      delta: `\n\n_Asking: ${question}_\n\n`,
+                      delta: formatAskUserQuestion(parsedInput),
                     })
                     endTextBlock()
                   } else if (block.name === "ExitPlanMode") {
