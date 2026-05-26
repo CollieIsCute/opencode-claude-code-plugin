@@ -17,6 +17,12 @@ import type {
 import { mapTool } from "./tool-mapping.js"
 import { applyTaskCreateToolResult } from "./todo-ledger.js"
 import { getClaudeUserMessage } from "./message-builder.js"
+import {
+  QUESTION_TOOL_NAME,
+  clearExitPlanModeQuestions,
+  consumeExitPlanModeQuestionResult,
+  createExitPlanModeQuestionCall,
+} from "./plan-mode-question.js"
 import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
 import {
   getRuntimeMcpStatus,
@@ -1237,17 +1243,16 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearExitPlanModeQuestions(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
     const includeHistoryContext = !hasExistingSession && hasPriorConversation
 
     const reasoningEffort = this.getReasoningEffort(options.providerOptions)
-    const userMsg = getClaudeUserMessage(
-      options.prompt,
-      includeHistoryContext,
-      reasoningEffort,
-    )
+    const userMsg =
+      consumeExitPlanModeQuestionResult(sk, options.prompt as any) ??
+      getClaudeUserMessage(options.prompt, includeHistoryContext, reasoningEffort)
 
     // doGenerate always spawns a fresh process, never reuse session ID.
     // Pre-fetch opencode's MCP runtime status so the bridge overlays
@@ -1394,7 +1399,17 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     unknown
                   >
                   const plan = (parsedInput?.plan as string) || ""
-                  responseText += `\n\n${plan}\n\n---\n**Do you want to proceed with this plan?** (yes/no)\n`
+                  const questionCall = createExitPlanModeQuestionCall(
+                    sk,
+                    block.id,
+                    plan,
+                  )
+                  responseText += questionCall.text
+                  toolCalls.push({
+                    id: questionCall.toolCallId,
+                    name: questionCall.toolName,
+                    args: questionCall.input,
+                  })
                   continue
                 }
 
@@ -1457,7 +1472,19 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   error: String(err),
                 })
               }
-              toolCalls.push({ id: tc.id, name: tc.name, args })
+              if (tc.name === "ExitPlanMode") {
+                const parsedInput = args as Record<string, unknown>
+                const plan = (parsedInput?.plan as string) || ""
+                const questionCall = createExitPlanModeQuestionCall(sk, tc.id, plan)
+                responseText += questionCall.text
+                toolCalls.push({
+                  id: questionCall.toolCallId,
+                  name: questionCall.toolName,
+                  args: questionCall.input,
+                })
+              } else {
+                toolCalls.push({ id: tc.id, name: tc.name, args })
+              }
               toolCallStreams.delete(msg.index)
             }
           }
@@ -1553,6 +1580,17 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     }
 
     for (const tc of result.toolCalls) {
+      if (tc.name === QUESTION_TOOL_NAME) {
+        content.push({
+          type: "tool-call",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          input: JSON.stringify(tc.args),
+          providerExecuted: false,
+        } as any)
+        continue
+      }
+
       const {
         name: mappedName,
         input: mappedInput,
@@ -1577,11 +1615,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
     return {
       content,
-      // Claude CLI's `result` message signals a fully-completed turn —
-      // tools have already been executed internally and final assistant
-      // text has been produced. Always report "stop" so opencode doesn't
-      // loop expecting to run tools itself.
-      finishReason: this.toFinishReason("stop"),
+      // Claude CLI's `result` message normally signals a fully-completed turn:
+      // tools have already been executed internally and final assistant text
+      // has been produced. ExitPlanMode is the exception: we surface it as
+      // opencode's native question tool so the outer loop must run that tool.
+      finishReason: this.toFinishReason(
+        result.toolCalls.some((tc) => tc.name === QUESTION_TOOL_NAME)
+          ? "tool-calls"
+          : "stop",
+      ),
       usage,
       request: { body: { text: userMsg } },
       response: {
@@ -1702,6 +1744,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearExitPlanModeQuestions(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -1710,12 +1753,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       !hasExistingSession && !hasActiveProcess && hasPriorConversation
 
     const reasoningEffort = this.getReasoningEffort(options.providerOptions)
-    const userMsg = getClaudeUserMessage(
-      options.prompt,
-      includeHistoryContext,
-      reasoningEffort,
-      { compactionMode },
-    )
+    const exitPlanModeQuestionResult = compactionMode
+      ? null
+      : consumeExitPlanModeQuestionResult(sk, options.prompt as any)
+    const userMsg =
+      exitPlanModeQuestionResult ??
+      getClaudeUserMessage(options.prompt, includeHistoryContext, reasoningEffort, {
+        compactionMode,
+      })
     const resolvedProxy = compactionMode ? null : this.resolvedProxyTools()
     const self = this
 
@@ -2039,6 +2084,39 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           } catch {}
         }
 
+        const finishWithExitPlanQuestion = (
+          call: ReturnType<typeof createExitPlanModeQuestionCall>,
+        ) => {
+          if (controllerClosed) return
+          endTextBlock()
+          controller.enqueue({
+            type: "tool-input-start",
+            id: call.toolCallId,
+            toolName: call.toolName,
+            providerExecuted: false,
+          } as any)
+          controller.enqueue({
+            type: "tool-call",
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            input: JSON.stringify(call.input),
+            providerExecuted: false,
+          } as any)
+          controller.enqueue({
+            type: "finish",
+            finishReason: toFinishReason("tool-calls"),
+            usage: toUsage(resultMeta.usage),
+            providerMetadata: {
+              "claude-code": resultMeta,
+            },
+          })
+          controllerClosed = true
+          cleanupTurn()
+          try {
+            controller.close()
+          } catch {}
+        }
+
         const drainNow = () => {
           if (drainTimer) {
             clearTimeout(drainTimer)
@@ -2303,14 +2381,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   endTextBlock()
                 } else if (tc.name === "ExitPlanMode") {
                   const plan = (parsedInput?.plan as string) || ""
+                  const questionCall = createExitPlanModeQuestionCall(
+                    sk,
+                    tc.id,
+                    plan,
+                  )
 
                   const planId = startTextBlock()
                   controller.enqueue({
                     type: "text-delta",
                     id: planId,
-                    delta: `\n\n${plan}\n\n---\n**Do you want to proceed with this plan?** (yes/no)\n`,
+                    delta: questionCall.text,
                   })
-                  endTextBlock()
+                  finishWithExitPlanQuestion(questionCall)
+                  return
                 } else if (tc.name.startsWith(PROXY_TOOL_PREFIX)) {
                   log.debug("ignoring proxy tool_use block; broker handles it", {
                     name: tc.name,
@@ -2500,14 +2584,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     endTextBlock()
                   } else if (block.name === "ExitPlanMode") {
                     const plan = (parsedInput?.plan as string) || ""
+                    const questionCall = createExitPlanModeQuestionCall(
+                      sk,
+                      block.id,
+                      plan,
+                    )
 
                     const planId = startTextBlock()
                     controller.enqueue({
                       type: "text-delta",
                       id: planId,
-                      delta: `\n\n${plan}\n\n---\n**Do you want to proceed with this plan?** (yes/no)\n`,
+                      delta: questionCall.text,
                     })
-                    endTextBlock()
+                    finishWithExitPlanQuestion(questionCall)
+                    return
                   } else if (block.name.startsWith(PROXY_TOOL_PREFIX)) {
                     log.debug("ignoring proxy tool_use from assistant message", {
                       name: block.name,
